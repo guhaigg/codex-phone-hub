@@ -210,6 +210,9 @@ async function captureRuntimeFailures(page: Page): Promise<void> {
     if (request.url().includes('/api/turns/') && request.url().includes('/events')) {
       return;
     }
+    if (request.url().includes('/api/terminals/') && request.url().includes('/events')) {
+      return;
+    }
     failures.push(`${request.method()} ${request.url()} ${request.failure()?.errorText || 'failed'}`);
   });
   await page.exposeFunction('__codexE2eFailures', () => failures);

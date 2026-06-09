@@ -247,6 +247,34 @@ test('GET /api/sessions/:sessionId/workspace/files rejects path traversal', asyn
   }
 });
 
+test('GET /api/runtime/health treats usage failures as non-blocking provider health', async () => {
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      listModels: async () => [{ id: 'third-party-model', name: '第三方模型' }],
+      readUsage: async () => {
+        throw new Error('official usage endpoint unavailable');
+      },
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/runtime/health`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json() as any;
+    assert.equal(payload.health.status, 'provider_ok');
+    assert.equal(payload.health.models.status, 'provider_ok');
+    assert.equal(payload.health.usage.status, 'official_usage_unavailable');
+    assert.equal(payload.health.usage.required, false);
+  } finally {
+    await server.stop();
+  }
+});
+
 test('POST /api/sessions/:sessionId/terminal starts a scoped command and streams output', async () => {
   const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-terminal-route-'));
   const server = createCodexWebServer({

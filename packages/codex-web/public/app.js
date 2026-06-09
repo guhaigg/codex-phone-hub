@@ -67,6 +67,8 @@ const state = {
   admin: { settings: null, projects: [], roles: [], users: [] },
   adminLoading: false,
   adminSaving: false,
+  runtimeHealth: null,
+  runtimeHealthLoading: false,
   model: "",
   view: "sessions",
   isMobile: window.innerWidth < 820,
@@ -1085,9 +1087,11 @@ function renderSettings(mobile) {
         </section>
         <section class="open-section">
           <div class="section-kicker">维护</div>
+          ${settingStatic("Provider", runtimeHealthText(), runtimeHealthIcon())}
           ${settingStatic("用量", usageText(), "info")}
           ${settingStatic("版本", `Build ${APP_BUILD_ID}`, "code")}
           <div class="action-line">
+            <button class="ghost-action" type="button" id="refresh-runtime-health">${state.runtimeHealthLoading ? "刷新中..." : "刷新状态"}</button>
             <button class="ghost-action" type="button" id="refresh-usage">刷新用量</button>
             <button class="ghost-action" type="button" id="reload-runtime">重载运行时</button>
             <button class="ghost-action danger" type="button" id="clear-cache">清理缓存</button>
@@ -1142,7 +1146,7 @@ function renderCapabilities(mobile) {
     ["附件与文件上下文", state.selectedFiles.length ? `${state.selectedFiles.length} 个待发送文件` : "支持文件上传", "手机端可上传文件给 Codex 读取和处理", "doc", "chat"],
     ["目标与命令", "/status · /model · /plan", "远程工作台命令可直接插入输入框", "code", "chat"],
     ["报告", `${state.reports.length || "未加载"} 个`, "查看任务沉淀、帮助文档和报告内容", "doc", "reports"],
-    ["运行时", usageText(), "刷新用量、重载运行时、清理缓存", "refresh", "settings"],
+    ["运行时", runtimeHealthText(), "Provider 状态、用量、重载运行时、清理缓存", "refresh", "settings"],
     ["项目与服务", state.admin.settings ? `${state.admin.projects.length} 个项目` : "点击加载", "维护个人项目目录和服务状态", "folder", "projects"],
   ];
   return `
@@ -1673,6 +1677,7 @@ function bindApp(root = document) {
     form.addEventListener("submit", saveAdminProject);
   }
   qs("#refresh-usage")?.addEventListener("click", () => refreshUsage());
+  qs("#refresh-runtime-health")?.addEventListener("click", () => refreshRuntimeHealth());
   qs("#reload-runtime")?.addEventListener("click", reloadRuntime);
   qs("#logout-button")?.addEventListener("click", logout);
   qs("#clear-cache")?.addEventListener("click", clearLocalCache);
@@ -1921,12 +1926,14 @@ async function setView(view) {
     await Promise.all([
       !state.ecosystem.loaded && !state.ecosystem.loading ? refreshEcosystem({ silent: true }) : null,
       !state.admin.settings && !state.adminLoading ? refreshAdmin({ silent: true }) : null,
+      !state.runtimeHealth && !state.runtimeHealthLoading ? refreshRuntimeHealth({ silent: true }) : null,
     ]);
     return;
   }
   if (state.view === "settings") {
     await Promise.all([
       refreshModels().catch(() => null),
+      refreshRuntimeHealth({ silent: true }).catch(() => null),
     ]);
     renderAfterBackgroundRefresh();
   }
@@ -1962,6 +1969,29 @@ async function refreshUsage({ silent = false } = {}) {
     state.usage = { error: error?.payload?.message || error?.message || "无法读取用量" };
     if (!silent) state.notice = state.usage.error;
   } finally {
+    if (!silent) render();
+  }
+}
+
+async function refreshRuntimeHealth({ silent = false } = {}) {
+  state.runtimeHealthLoading = true;
+  if (!silent) {
+    state.notice = "正在刷新运行状态";
+    render();
+  }
+  try {
+    const payload = await apiFetch("/api/runtime/health");
+    state.runtimeHealth = payload?.health || null;
+    if (!silent) state.notice = "运行状态已刷新";
+  } catch (error) {
+    state.runtimeHealth = {
+      status: "failed",
+      usage: { status: "official_usage_unavailable", required: false },
+      message: error?.payload?.message || error?.message || "运行状态读取失败",
+    };
+    if (!silent) state.notice = state.runtimeHealth.message;
+  } finally {
+    state.runtimeHealthLoading = false;
     if (!silent) render();
   }
 }
@@ -3869,8 +3899,8 @@ function modelOptions() {
 }
 
 function usageText() {
-  if (!state.usage) return "按需刷新";
-  if (state.usage.error) return state.usage.error;
+  if (!state.usage) return "按需刷新；第三方 API 可不支持官方用量";
+  if (state.usage.error) return `${state.usage.error} · 不影响第三方 API 模式`;
   if (typeof state.usage === "string") return state.usage;
   const parts = [];
   for (const [key, value] of Object.entries(state.usage)) {
@@ -3878,6 +3908,37 @@ function usageText() {
     parts.push(`${key}: ${value}`);
   }
   return parts.slice(0, 3).join(" · ") || "已连接";
+}
+
+function runtimeHealthText() {
+  if (state.runtimeHealthLoading && !state.runtimeHealth) return "检查中";
+  const health = state.runtimeHealth || {};
+  const status = health.status || "unknown";
+  const statusText = {
+    provider_ok: "Provider OK",
+    auth_missing: "认证缺失",
+    unsupported: "不支持",
+    failed: "运行时异常",
+    unknown: "按需刷新",
+  }[status] || "按需刷新";
+  const modelCount = Number(health.models?.count || 0);
+  const modelText = modelCount ? `${modelCount} 个模型` : "模型待确认";
+  const usageStatus = health.usage?.status || "";
+  const usageTextValue = usageStatus === "provider_ok"
+    ? "官方用量可读"
+    : usageStatus === "official_usage_unavailable"
+      ? "官方用量不可用，不影响第三方 API"
+      : usageStatus === "auth_missing"
+        ? "官方认证缺失"
+        : "用量待确认";
+  return `${statusText} · ${modelText} · ${usageTextValue}`;
+}
+
+function runtimeHealthIcon() {
+  const status = state.runtimeHealth?.status || "";
+  if (status === "provider_ok") return "check";
+  if (status === "auth_missing" || status === "failed") return "info";
+  return "refresh";
 }
 
 function formatBytes(value) {

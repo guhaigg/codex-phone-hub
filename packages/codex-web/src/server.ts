@@ -530,6 +530,11 @@ async function handleRequest({
     return;
   }
 
+  if (pathname === '/api/runtime/health' && method === 'GET') {
+    writeJson(response, 200, { health: await readRuntimeHealth(runtime) });
+    return;
+  }
+
   const reportStore = new FileReportStore({
     reportsDir: config.reportsDir,
     indexPath: config.reportIndexPath,
@@ -3634,6 +3639,107 @@ async function readReportForResponse(
     }
     throw error;
   }
+}
+
+async function readRuntimeHealth(runtime: CodexWebRuntime): Promise<Record<string, unknown>> {
+  const checkedAt = new Date().toISOString();
+  const models: Record<string, unknown> = {
+    status: 'unknown',
+    count: 0,
+    items: [],
+  };
+  const usage: Record<string, unknown> = {
+    status: 'official_usage_unavailable',
+    available: false,
+    required: false,
+    message: 'Official usage data is unavailable; third-party API mode can still run.',
+  };
+
+  try {
+    const items = await runtime.listModels();
+    models.status = 'provider_ok';
+    models.count = Array.isArray(items) ? items.length : 0;
+    models.items = Array.isArray(items)
+      ? items.slice(0, 8).map((item) => summarizeRuntimeModel(item))
+      : [];
+  } catch (error) {
+    models.status = classifyProviderHealthError(error);
+    models.error = messageFromUnknown(error);
+  }
+
+  try {
+    const report = await runtime.readUsage();
+    if (report) {
+      usage.status = 'provider_ok';
+      usage.available = true;
+      usage.required = false;
+      usage.message = 'Usage data is available.';
+      const usageRecord = report as unknown as Record<string, unknown>;
+      const planType = typeof usageRecord.planType === 'string'
+        ? usageRecord.planType
+        : '';
+      if (planType) {
+        usage.planType = planType;
+      }
+    }
+  } catch (error) {
+    usage.status = 'official_usage_unavailable';
+    usage.available = false;
+    usage.required = false;
+    usage.message = messageFromUnknown(error) || 'Official usage data is unavailable; third-party API mode can still run.';
+  }
+
+  const status = models.status === 'provider_ok'
+    ? 'provider_ok'
+    : models.status === 'auth_missing'
+      ? 'auth_missing'
+      : models.status === 'unsupported'
+        ? 'unsupported'
+        : 'failed';
+  return {
+    status,
+    checkedAt,
+    models,
+    usage,
+  };
+}
+
+function summarizeRuntimeModel(item: unknown): Record<string, unknown> {
+  if (!item || typeof item !== 'object') {
+    return { id: String(item || '') };
+  }
+  const record = item as Record<string, unknown>;
+  const id = typeof record.id === 'string'
+    ? record.id
+    : typeof record.model === 'string'
+      ? record.model
+      : typeof record.name === 'string'
+        ? record.name
+        : '';
+  const name = typeof record.name === 'string'
+    ? record.name
+    : typeof record.displayName === 'string'
+      ? record.displayName
+      : id;
+  return {
+    id,
+    name,
+  };
+}
+
+function classifyProviderHealthError(error: unknown): 'auth_missing' | 'unsupported' | 'failed' {
+  const message = messageFromUnknown(error).toLowerCase();
+  if (/\b(unauthorized|forbidden|not\s*logged\s*in|login|required auth|auth required|api key|invalid key|401|403)\b/u.test(message)) {
+    return 'auth_missing';
+  }
+  if (/\b(unsupported|not supported|not implemented)\b/u.test(message)) {
+    return 'unsupported';
+  }
+  return 'failed';
+}
+
+function messageFromUnknown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error || '');
 }
 
 function writeReportNotFound(response: ServerResponse): void {
