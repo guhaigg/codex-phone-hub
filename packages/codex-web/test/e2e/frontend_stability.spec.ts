@@ -159,6 +159,35 @@ test('desktop workspace terminal runs a command without freezing the composer', 
   await expect(prompt).toHaveValue('终端运行后仍可输入');
 });
 
+test('desktop workspace artifacts preview without replacing the composer', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const sessionLoaded = page.waitForResponse((response) => (
+    response.url().endsWith('/api/sessions/session_existing')
+    && response.status() === 200
+  ));
+  await page.locator('[data-session-open="session_existing"]').click();
+  await sessionLoaded;
+  const prompt = page.locator('#prompt-input');
+  await expect(prompt).toBeVisible();
+
+  const artifactsLoaded = page.waitForResponse((response) => (
+    response.url().endsWith('/api/sessions/session_existing/artifacts')
+    && response.status() === 200
+  ));
+  await page.locator('#toggle-workspace').click();
+  await artifactsLoaded;
+  await expect(page.locator('.artifact-panel')).toBeVisible();
+  await prompt.fill('预览产物时输入框保持可用');
+  const promptHandle = await prompt.elementHandle();
+  expect(promptHandle).not.toBeNull();
+
+  await page.locator('[data-artifact-open]').filter({ hasText: 'README.md' }).first().click();
+  await expect(page.locator('.artifact-preview')).toContainText('E2E Artifact');
+
+  await expect(prompt).toHaveValue('预览产物时输入框保持可用');
+  expect(await promptHandle!.evaluate((node) => node.isConnected)).toBe(true);
+});
+
 test('mobile new conversation and refresh keep the composer usable', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.reload();
@@ -211,6 +240,9 @@ async function captureRuntimeFailures(page: Page): Promise<void> {
       return;
     }
     if (request.url().includes('/api/terminals/') && request.url().includes('/events')) {
+      return;
+    }
+    if (request.url().includes('/api/sessions/') && request.url().includes('/artifacts') && request.failure()?.errorText === 'net::ERR_ABORTED') {
       return;
     }
     failures.push(`${request.method()} ${request.url()} ${request.failure()?.errorText || 'failed'}`);

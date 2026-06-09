@@ -14,13 +14,17 @@ export interface FrontendE2eServer {
 
 export async function startFrontendE2eServer(): Promise<FrontendE2eServer> {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-e2e-'));
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-e2e-project-'));
+  await fs.writeFile(path.join(projectDir, 'README.md'), '# E2E Artifact\n', 'utf8');
+  await fs.mkdir(path.join(stateDir, 'reports', 'project-e2e'), { recursive: true });
+  await fs.writeFile(path.join(stateDir, 'reports', 'project-e2e', 'summary.md'), '# E2E Summary\n', 'utf8');
   const eventBus = new CodexWebEventBus();
-  const runtime = new FrontendE2eRuntime(eventBus);
+  const runtime = new FrontendE2eRuntime(eventBus, projectDir);
   const server = createCodexWebServer({
     auth: new FrontendE2eAuth(),
     runtime: runtime as any,
-    config: createE2eConfig(stateDir),
-    identityStore: new FrontendE2eIdentityStore(),
+    config: createE2eConfig(stateDir, projectDir),
+    identityStore: new FrontendE2eIdentityStore(projectDir),
   });
   await server.start();
   return {
@@ -28,15 +32,16 @@ export async function startFrontendE2eServer(): Promise<FrontendE2eServer> {
     async stop() {
       await stopServer(server);
       await fs.rm(stateDir, { recursive: true, force: true });
+      await fs.rm(projectDir, { recursive: true, force: true });
     },
   };
 }
 
-function createE2eConfig(stateDir: string): CodexWebConfig {
+function createE2eConfig(stateDir: string, defaultCwd: string): CodexWebConfig {
   return {
     host: '127.0.0.1',
     port: 0,
-    defaultCwd: process.cwd(),
+    defaultCwd,
     codexBin: 'codex',
     stateDir,
     authPath: path.join(stateDir, 'auth.json'),
@@ -87,6 +92,8 @@ class FrontendE2eAuth implements CodexWebAuthLike {
 }
 
 class FrontendE2eIdentityStore {
+  constructor(private readonly projectDir: string) {}
+
   async readState(): Promise<CodexWebIdentityState> {
     return {
       settings: {
@@ -99,7 +106,7 @@ class FrontendE2eIdentityStore {
         {
           id: 'project_phone_hub',
           internalName: 'phone-hub',
-          cwd: process.cwd(),
+          cwd: this.projectDir,
           displayName: 'phone hub',
           enabled: true,
           activeSessionLimit: null,
@@ -119,7 +126,10 @@ class FrontendE2eRuntime {
 
   private nextTurn = 1;
 
-  constructor(private readonly eventBus: CodexWebEventBus) {
+  constructor(
+    private readonly eventBus: CodexWebEventBus,
+    private readonly projectDir: string,
+  ) {
     const first = this.createSessionObject('session_existing', '现有会话', '已经可以从侧边栏打开');
     first.timeline = [
       { id: 'msg_existing_user', kind: 'message', role: 'user', text: '检查页面稳定性', createdAt: Date.now() - 10_000 } as any,
@@ -231,7 +241,7 @@ class FrontendE2eRuntime {
     const now = Date.now();
     return {
       id,
-      cwd: process.cwd(),
+      cwd: this.projectDir,
       projectName: 'phone hub',
       title,
       updatedAt: now,
@@ -246,7 +256,7 @@ class FrontendE2eRuntime {
       activeTurnRecoverable: false,
       lastKnownTurnStatus: null,
       settings: {},
-      thread: { id, title, cwd: process.cwd(), updatedAt: now } as any,
+      thread: { id, title, cwd: this.projectDir, updatedAt: now } as any,
       timeline: [],
     };
   }

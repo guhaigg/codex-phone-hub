@@ -26,6 +26,12 @@ import type {
 } from './identity_store.js';
 import { FileReportStore } from './report_store.js';
 import type { CodexWebReport } from './report_store.js';
+import {
+  ArtifactStoreError,
+  FileArtifactStore,
+  type CodexWebArtifactBinary,
+  type ListArtifactsInput,
+} from './artifact_store.js';
 import type {
   CodexWebRuntime,
   CodexWebSession,
@@ -539,6 +545,7 @@ async function handleRequest({
     reportsDir: config.reportsDir,
     indexPath: config.reportIndexPath,
   });
+  const artifactStore = createArtifactStore(config);
 
   if (pathname === '/api/reports' && method === 'GET') {
     writeJson(response, 200, { items: await reportStore.listReports() });
@@ -862,6 +869,55 @@ async function handleRequest({
       filePath: url.searchParams.get('path'),
     });
     return;
+  }
+
+  const sessionArtifactsMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/artifacts$/u);
+  if (sessionArtifactsMatch && method === 'GET') {
+    const sessionId = decodeURIComponent(sessionArtifactsMatch[1]!);
+    const session = await runtime.readSession(sessionId);
+    if (!session) {
+      writeSessionNotFound(response);
+      return;
+    }
+    await writeArtifactJsonResponse(response, async () => ({
+      items: await artifactStore.listForSession(artifactInputFromRuntimeSession(sessionId, session)),
+    }));
+    return;
+  }
+
+  const sessionArtifactActionMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/artifacts\/([^/]+)\/(content|download|favorite)$/u);
+  if (sessionArtifactActionMatch) {
+    const sessionId = decodeURIComponent(sessionArtifactActionMatch[1]!);
+    const artifactId = decodeURIComponent(sessionArtifactActionMatch[2]!);
+    const action = sessionArtifactActionMatch[3]!;
+    const session = await runtime.readSession(sessionId);
+    if (!session) {
+      writeSessionNotFound(response);
+      return;
+    }
+    const input = artifactInputFromRuntimeSession(sessionId, session);
+    if (action === 'content' && method === 'GET') {
+      await writeArtifactJsonResponse(response, () => artifactStore.readContent(artifactId, input));
+      return;
+    }
+    if (action === 'download' && method === 'GET') {
+      await writeArtifactDownloadResponse(response, () => artifactStore.readBinary(artifactId, input));
+      return;
+    }
+    if (action === 'favorite' && method === 'PATCH') {
+      const body = await readJsonBody(request);
+      if (typeof body.favorite !== 'boolean') {
+        writeJson(response, 400, { error: 'favorite must be a boolean' });
+        return;
+      }
+      const favorite = body.favorite;
+      await writeArtifactJsonResponse(response, async () => {
+        await artifactStore.readArtifact(artifactId, input);
+        await artifactStore.setFavorite(artifactId, favorite);
+        return { artifact: await artifactStore.readArtifact(artifactId, input) };
+      });
+      return;
+    }
   }
 
   const sessionMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/u);
@@ -1830,6 +1886,70 @@ async function handleMultiUserRequest({
       filePath: url.searchParams.get('path'),
     });
     return true;
+  }
+
+  const sessionArtifactsMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/artifacts$/u);
+  if (sessionArtifactsMatch && method === 'GET') {
+    const resolved = resolveReadableWorkspaceAppSession(identityState, principal, decodeURIComponent(sessionArtifactsMatch[1]!));
+    if (!resolved) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    const artifactStore = createArtifactStore(config);
+    const input = await artifactInputFromAppSession({
+      runtime,
+      appSession: resolved.appSession,
+      project: resolved.project,
+    });
+    await writeArtifactJsonResponse(response, async () => ({
+      items: await artifactStore.listForSession(input),
+    }));
+    return true;
+  }
+
+  const sessionArtifactActionMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/artifacts\/([^/]+)\/(content|download|favorite)$/u);
+  if (sessionArtifactActionMatch) {
+    const sessionId = decodeURIComponent(sessionArtifactActionMatch[1]!);
+    const artifactId = decodeURIComponent(sessionArtifactActionMatch[2]!);
+    const action = sessionArtifactActionMatch[3]!;
+    const resolved = action === 'favorite'
+      ? resolveWritableAppSession(identityState, principal, sessionId)
+      : resolveReadableWorkspaceAppSession(identityState, principal, sessionId);
+    if (!resolved) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    if (action === 'favorite' && rejectArchivedSessionWrite(response, resolved.appSession)) {
+      return true;
+    }
+    const artifactStore = createArtifactStore(config);
+    const input = await artifactInputFromAppSession({
+      runtime,
+      appSession: resolved.appSession,
+      project: resolved.project,
+    });
+    if (action === 'content' && method === 'GET') {
+      await writeArtifactJsonResponse(response, () => artifactStore.readContent(artifactId, input));
+      return true;
+    }
+    if (action === 'download' && method === 'GET') {
+      await writeArtifactDownloadResponse(response, () => artifactStore.readBinary(artifactId, input));
+      return true;
+    }
+    if (action === 'favorite' && method === 'PATCH') {
+      const body = await readJsonBody(request);
+      if (typeof body.favorite !== 'boolean') {
+        writeJson(response, 400, { error: 'favorite must be a boolean' });
+        return true;
+      }
+      const favorite = body.favorite;
+      await writeArtifactJsonResponse(response, async () => {
+        await artifactStore.readArtifact(artifactId, input);
+        await artifactStore.setFavorite(artifactId, favorite);
+        return { artifact: await artifactStore.readArtifact(artifactId, input) };
+      });
+      return true;
+    }
   }
 
   const sessionMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/u);
@@ -3742,6 +3862,100 @@ function messageFromUnknown(error: unknown): string {
   return error instanceof Error ? error.message : String(error || '');
 }
 
+function createArtifactStore(config: CodexWebConfig): FileArtifactStore {
+  return new FileArtifactStore({
+    reportsDir: config.reportsDir,
+    indexPath: path.join(config.stateDir, 'artifact-index.json'),
+    reportIndexPath: config.reportIndexPath,
+  });
+}
+
+function artifactInputFromRuntimeSession(sessionId: string, session: CodexWebSession): ListArtifactsInput {
+  const sessionRecord = session as CodexWebSession & { projectId?: unknown };
+  return {
+    sessionId,
+    projectId: normalizeOptionalString(sessionRecord.projectId) || null,
+    projectCwd: normalizeOptionalString(session.cwd) || null,
+  };
+}
+
+async function artifactInputFromAppSession({
+  runtime,
+  appSession,
+  project,
+}: {
+  runtime: CodexWebRuntime;
+  appSession: CodexWebAppSession;
+  project: CodexWebProject | null;
+}): Promise<ListArtifactsInput> {
+  const runtimeSession = project?.cwd ? null : await runtime.readSession(appSession.codexThreadId);
+  return {
+    sessionId: appSession.id,
+    projectId: appSession.projectId,
+    projectCwd: normalizeOptionalString(project?.cwd) || normalizeOptionalString(runtimeSession?.cwd) || null,
+  };
+}
+
+async function writeArtifactJsonResponse<T>(
+  response: ServerResponse,
+  read: () => Promise<T>,
+): Promise<void> {
+  try {
+    writeJson(response, 200, await read());
+  } catch (error) {
+    if (!writeArtifactStoreError(response, error)) {
+      throw error;
+    }
+  }
+}
+
+async function writeArtifactDownloadResponse(
+  response: ServerResponse,
+  read: () => Promise<CodexWebArtifactBinary>,
+): Promise<void> {
+  try {
+    const { artifact, body } = await read();
+    const fileName = artifactDownloadFileName(artifact.displayPath, artifact.title);
+    response.writeHead(200, {
+      'Content-Type': artifact.mimeType,
+      'Content-Length': String(body.byteLength),
+      'Content-Disposition': contentDispositionAttachment(fileName),
+      'Cache-Control': 'no-store',
+    });
+    response.end(body);
+  } catch (error) {
+    if (!writeArtifactStoreError(response, error)) {
+      throw error;
+    }
+  }
+}
+
+function writeArtifactStoreError(response: ServerResponse, error: unknown): boolean {
+  if (!(error instanceof ArtifactStoreError)) {
+    return false;
+  }
+  writeJson(response, error.status, {
+    error: error.code,
+    message: error.message,
+  });
+  return true;
+}
+
+function artifactDownloadFileName(displayPath: string, title: string): string {
+  const normalized = String(displayPath || '').replace(/\\/gu, '/');
+  return path.posix.basename(normalized) || normalizeOptionalString(title) || 'artifact';
+}
+
+function contentDispositionAttachment(fileName: string): string {
+  const fallback = fileName.replace(/[^\x20-\x7E]/gu, '_').replace(/["\\]/gu, '_') || 'artifact';
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeRfc5987(fileName)}`;
+}
+
+function encodeRfc5987(value: string): string {
+  return encodeURIComponent(value)
+    .replace(/['()*]/gu, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
 function writeReportNotFound(response: ServerResponse): void {
   writeJson(response, 404, {
     error: 'report_not_found',
@@ -4168,6 +4382,21 @@ function writeErrorResponse({
     return;
   }
   if (error instanceof TerminalManagerError) {
+    writeRequestLog({
+      level: error.status >= 500 ? 'error' : 'warn',
+      method: request.method ?? 'GET',
+      path: request.url ?? '/',
+      status: error.status,
+      code: error.code,
+      message: error.message,
+    });
+    writeJson(response, error.status, {
+      error: error.code,
+      message: error.message,
+    });
+    return;
+  }
+  if (error instanceof ArtifactStoreError) {
     writeRequestLog({
       level: error.status >= 500 ? 'error' : 'warn',
       method: request.method ?? 'GET',

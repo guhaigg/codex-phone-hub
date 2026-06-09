@@ -47,6 +47,11 @@ const state = {
   currentReport: null,
   reportContent: "",
   reportLoading: false,
+  artifacts: [],
+  currentArtifact: null,
+  artifactContent: null,
+  artifactLoading: false,
+  artifactError: "",
   ecosystem: {
     loading: false,
     loaded: false,
@@ -750,6 +755,7 @@ function renderWorkspaceInspector() {
       ${state.workspaceLoading ? `<div class="workspace-muted">正在读取工作区...</div>` : ""}
       ${state.workspaceError ? `<div class="workspace-error">${escapeHtml(state.workspaceError)}</div>` : ""}
       ${renderWorkspaceTerminalPanel()}
+      ${renderArtifactPanel("workspace")}
       ${state.workspaceStatus ? `
         <div class="workspace-status-line">
           <span>${escapeHtml(status.isGitRepository ? (status.branch || "detached") : "非 Git 目录")}</span>
@@ -846,6 +852,128 @@ function renderWorkspaceFilePreview() {
       <pre><code>${escapeHtml(truncateTimelineText(state.workspaceFile.content || ""))}</code></pre>
     </article>
   `;
+}
+
+function renderArtifactPanel(context = "workspace") {
+  const isReports = context === "reports";
+  const title = isReports ? "项目产物" : "本次产物";
+  const subtitle = currentSessionId()
+    ? `${state.artifacts.length} 个文件`
+    : "打开会话后显示";
+  const classes = [
+    "artifact-panel",
+    isReports ? "artifact-panel-page" : "artifact-panel-inline",
+  ].join(" ");
+  return `
+    <section class="${classes}" data-artifact-panel="${escapeAttribute(context)}">
+      <header>
+        <div>
+          <strong>${escapeHtml(title)}</strong>
+          <small>${escapeHtml(subtitle)}</small>
+        </div>
+        <button type="button" class="mini-btn" data-refresh-artifacts title="刷新">${icon("refresh")}</button>
+      </header>
+      ${state.artifactError ? `<div class="workspace-error">${escapeHtml(state.artifactError)}</div>` : ""}
+      ${state.artifactLoading && !state.artifacts.length ? renderArtifactLoading() : renderArtifactBody(isReports)}
+    </section>
+  `;
+}
+
+function renderArtifactLoading() {
+  return `<div class="artifact-loading"><span></span><span></span><span></span></div>`;
+}
+
+function renderArtifactBody(isReports) {
+  if (!currentSessionId()) {
+    return `<div class="workspace-muted">先打开一个会话，再查看这次任务产物。</div>`;
+  }
+  if (!state.artifacts.length) {
+    return `<div class="workspace-muted">还没有可展示的产物。支持 Markdown、文本、图片、PDF 和下载文件。</div>`;
+  }
+  return `
+    <div class="artifact-layout ${isReports ? "wide" : ""}">
+      <div class="artifact-list">
+        ${state.artifacts.map(renderArtifactItem).join("")}
+      </div>
+      <div class="artifact-preview">
+        ${renderArtifactPreview()}
+      </div>
+    </div>
+  `;
+}
+
+function renderArtifactItem(artifact) {
+  const active = state.currentArtifact?.id === artifact.id;
+  return `
+    <article class="artifact-item ${active ? "active" : ""}">
+      <button type="button" class="artifact-main" data-artifact-open="${escapeAttribute(artifact.id)}">
+        <span class="artifact-kind">${escapeHtml(artifactKindLabel(artifact.kind))}</span>
+        <span class="artifact-title">${escapeHtml(artifact.displayPath || artifact.title || "产物")}</span>
+        <span class="artifact-meta">${escapeHtml(artifact.source === "report" ? "报告" : "工作区")} · ${escapeHtml(formatBytes(artifact.sizeBytes))}</span>
+      </button>
+      <div class="artifact-actions">
+        <button type="button" class="mini-btn" data-artifact-favorite="${escapeAttribute(artifact.id)}" title="收藏">${artifact.favorite ? "★" : "☆"}</button>
+        <button type="button" class="mini-btn" data-artifact-download="${escapeAttribute(artifact.id)}" title="下载">${icon("download")}</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderArtifactPreview() {
+  const artifact = state.currentArtifact;
+  if (!artifact) {
+    return `<div class="empty-inline"><h3>选择产物</h3><p>打开左侧文件查看内容或下载。</p></div>`;
+  }
+  if (state.artifactLoading) {
+    return renderArtifactLoading();
+  }
+  const content = state.artifactContent;
+  const actions = `
+    <div class="artifact-preview-actions">
+      <button type="button" class="mini-btn" data-artifact-download="${escapeAttribute(artifact.id)}">${icon("download")}下载</button>
+      <button type="button" class="mini-btn" data-artifact-favorite="${escapeAttribute(artifact.id)}">${artifact.favorite ? "★ 已收藏" : "☆ 收藏"}</button>
+    </div>
+  `;
+  const header = `
+    <header>
+      <div>
+        <strong>${escapeHtml(artifact.title || artifact.displayPath || "产物")}</strong>
+        <small>${escapeHtml(artifact.displayPath || "")} · ${escapeHtml(formatBytes(artifact.sizeBytes))}</small>
+      </div>
+      ${actions}
+    </header>
+  `;
+  if (!artifact.previewable || artifact.kind === "download") {
+    return `<article class="artifact-content">${header}<div class="workspace-muted">此文件不支持在线预览，请下载查看。</div></article>`;
+  }
+  if (artifact.kind === "pdf") {
+    return `<article class="artifact-content">${header}<div class="workspace-muted">PDF 可在手机或浏览器中下载后打开。</div></article>`;
+  }
+  if (!content) {
+    return `<article class="artifact-content">${header}<div class="workspace-muted">选择文件后显示预览。</div></article>`;
+  }
+  if (content.kind === "image" && content.contentBase64) {
+    const src = `data:${artifact.mimeType || "application/octet-stream"};base64,${content.contentBase64}`;
+    return `<article class="artifact-content">${header}<img class="artifact-image" src="${escapeAttribute(src)}" alt="${escapeAttribute(artifact.title || artifact.displayPath || "产物图片")}"></article>`;
+  }
+  return `
+    <article class="artifact-content">
+      ${header}
+      <pre><code>${escapeHtml(truncateTimelineText(content.content || ""))}</code></pre>
+    </article>
+  `;
+}
+
+function artifactKindLabel(kind) {
+  const labels = {
+    text: "TXT",
+    markdown: "MD",
+    html: "HTML",
+    image: "IMG",
+    pdf: "PDF",
+    download: "FILE",
+  };
+  return labels[kind] || "FILE";
 }
 
 function terminalStatusLabel(status) {
@@ -1460,8 +1588,8 @@ function renderReports(mobile) {
       <header class="settings-head tool-page-head">
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div>
-          <h1>报告</h1>
-          <p>沉淀输出、帮助文档和任务记录</p>
+          <h1>产物</h1>
+          <p>当前会话输出、报告和可下载文件</p>
         </div>
         <button class="icon-btn" id="refresh-reports" title="刷新">${icon("refresh")}</button>
       </header>
@@ -1475,6 +1603,9 @@ function renderReportLoading() {
 }
 
 function renderReportBody() {
+  if (currentSessionId() || state.artifacts.length || state.artifactLoading || state.artifactError) {
+    return renderArtifactPanel("reports");
+  }
   if (!state.reports.length) {
     return `
       <div class="empty-hero report-empty">
@@ -1670,6 +1801,7 @@ function bindApp(root = document) {
   });
   qs("#cap-new-session")?.addEventListener("click", openNewSession);
   qs("#refresh-reports")?.addEventListener("click", () => refreshReports());
+  qs("[data-refresh-artifacts]")?.addEventListener("click", () => refreshArtifacts());
   qs("#refresh-admin")?.addEventListener("click", () => refreshAdmin());
   qs("#refresh-ecosystem")?.addEventListener("click", () => refreshEcosystem());
   qs("#ecosystem-config-form")?.addEventListener("submit", writeEcosystemConfig);
@@ -1730,6 +1862,15 @@ function bindApp(root = document) {
   }
   for (const button of qsa("[data-report-favorite]")) {
     button.addEventListener("click", () => toggleReportFavorite(button.getAttribute("data-report-favorite") || ""));
+  }
+  for (const button of qsa("[data-artifact-open]")) {
+    button.addEventListener("click", () => selectArtifact(button.getAttribute("data-artifact-open") || ""));
+  }
+  for (const button of qsa("[data-artifact-favorite]")) {
+    button.addEventListener("click", () => toggleArtifactFavorite(button.getAttribute("data-artifact-favorite") || ""));
+  }
+  for (const button of qsa("[data-artifact-download]")) {
+    button.addEventListener("click", () => downloadArtifact(button.getAttribute("data-artifact-download") || ""));
   }
   for (const button of qsa("[data-workspace-file]")) {
     button.addEventListener("click", () => openWorkspaceFile(button.getAttribute("data-workspace-file") || ""));
@@ -1921,7 +2062,12 @@ async function setView(view) {
   state.view = view === "reports" || view === "settings" || view === "capabilities" ? view : "sessions";
   state.notice = "";
   renderWorkspaceOnly() || render();
-  if (state.view === "reports" && !state.reports.length) await refreshReports();
+  if (state.view === "reports") {
+    await Promise.all([
+      !state.reports.length ? refreshReports({ silent: true }) : null,
+      refreshArtifacts({ silent: true }),
+    ]);
+  }
   if (state.view === "capabilities") {
     await Promise.all([
       !state.ecosystem.loaded && !state.ecosystem.loading ? refreshEcosystem({ silent: true }) : null,
@@ -1996,16 +2142,125 @@ async function refreshRuntimeHealth({ silent = false } = {}) {
   }
 }
 
-async function refreshReports() {
+async function refreshReports({ silent = false } = {}) {
   state.reportLoading = true;
-  render();
+  if (!silent) render();
   try {
     const payload = await apiFetch("/api/reports");
     state.reports = Array.isArray(payload?.items) ? payload.items : [];
-    if (!state.currentReport && state.reports[0]) await selectReport(state.reports[0].id, { silent: true });
+    if (!currentSessionId() && !state.currentReport && state.reports[0]) await selectReport(state.reports[0].id, { silent: true });
   } finally {
     state.reportLoading = false;
-    renderAfterBackgroundRefresh();
+    if (silent) renderWorkspaceAfterBackgroundRefresh();
+    else renderAfterBackgroundRefresh();
+  }
+}
+
+async function refreshArtifacts({ silent = false } = {}) {
+  const sessionId = currentSessionId();
+  if (!sessionId) {
+    state.artifacts = [];
+    state.currentArtifact = null;
+    state.artifactContent = null;
+    state.artifactError = "";
+    if (!silent) renderArtifactsOnly() || renderWorkspaceOnly() || render();
+    return;
+  }
+  state.artifactLoading = true;
+  state.artifactError = "";
+  if (!silent) renderArtifactsOnly() || renderWorkspaceOnly() || render();
+  try {
+    const payload = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts`);
+    state.artifacts = Array.isArray(payload?.items) ? payload.items : [];
+    if (state.currentArtifact && !state.artifacts.some((item) => item.id === state.currentArtifact.id)) {
+      state.currentArtifact = null;
+      state.artifactContent = null;
+    }
+    if (!state.currentArtifact && state.artifacts[0]) {
+      state.currentArtifact = state.artifacts[0];
+      state.artifactContent = null;
+    } else if (state.currentArtifact) {
+      state.currentArtifact = state.artifacts.find((item) => item.id === state.currentArtifact.id) || state.currentArtifact;
+    }
+    if (state.currentArtifact?.previewable && state.currentArtifact.kind !== "pdf" && !state.artifactContent) {
+      await selectArtifact(state.currentArtifact.id, { silent: true });
+    }
+  } catch (error) {
+    state.artifactError = error?.payload?.message || error?.message || "产物读取失败";
+  } finally {
+    state.artifactLoading = false;
+    renderArtifactsOnly() || (silent ? renderWorkspaceAfterBackgroundRefresh() : renderWorkspaceOnly() || render());
+  }
+}
+
+async function selectArtifact(artifactId, { silent = false } = {}) {
+  const artifact = state.artifacts.find((item) => item.id === artifactId);
+  if (!artifact) return;
+  state.currentArtifact = artifact;
+  state.artifactContent = null;
+  state.artifactError = "";
+  if (!artifact.previewable || artifact.kind === "download" || artifact.kind === "pdf") {
+    renderArtifactsOnly() || renderWorkspaceOnly() || render();
+    return;
+  }
+  state.artifactLoading = true;
+  if (!silent) renderArtifactsOnly() || renderWorkspaceOnly() || render();
+  try {
+    const sessionId = currentSessionId();
+    if (!sessionId) return;
+    const payload = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/content`);
+    state.currentArtifact = payload?.artifact || artifact;
+    state.artifactContent = payload || null;
+    state.artifacts = state.artifacts.map((item) => item.id === state.currentArtifact.id ? { ...item, ...state.currentArtifact } : item);
+  } catch (error) {
+    state.artifactError = error?.payload?.message || error?.message || "产物预览失败";
+  } finally {
+    state.artifactLoading = false;
+    renderArtifactsOnly() || (silent ? renderWorkspaceAfterBackgroundRefresh() : renderWorkspaceOnly() || render());
+  }
+}
+
+async function toggleArtifactFavorite(artifactId) {
+  const artifact = state.artifacts.find((item) => item.id === artifactId) || state.currentArtifact;
+  const sessionId = currentSessionId();
+  if (!artifact || !sessionId) return;
+  try {
+    const payload = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/favorite`, {
+      method: "PATCH",
+      body: { favorite: !artifact.favorite },
+    });
+    const updated = payload?.artifact;
+    if (updated) {
+      state.artifacts = state.artifacts.map((item) => item.id === updated.id ? { ...item, ...updated } : item);
+      if (state.currentArtifact?.id === updated.id) state.currentArtifact = { ...state.currentArtifact, ...updated };
+    }
+  } catch (error) {
+    state.artifactError = error?.payload?.message || error?.message || "收藏失败";
+  }
+  renderArtifactsOnly() || renderWorkspaceOnly() || render();
+}
+
+async function downloadArtifact(artifactId) {
+  const sessionId = currentSessionId();
+  const artifact = state.artifacts.find((item) => item.id === artifactId) || state.currentArtifact;
+  if (!sessionId || !artifact) return;
+  try {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/download`, {
+      headers: state.token ? { Authorization: `Bearer ${state.token}` } : {},
+    });
+    if (!response.ok) throw await buildApiError(response);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = artifactFileName(artifact);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    state.artifactError = error?.payload?.message || error?.message || "下载失败";
+    renderArtifactsOnly() || renderWorkspaceOnly() || render();
   }
 }
 
@@ -2077,12 +2332,24 @@ async function refreshWorkspaceInspector() {
   state.workspaceError = "";
   render();
   try {
-    const [statusPayload, diffPayload] = await Promise.all([
+    const [statusPayload, diffPayload, artifactsPayload] = await Promise.all([
       apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/workspace/status`),
       apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/workspace/diff`),
+      apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts`).catch((error) => {
+        state.artifactError = error?.payload?.message || error?.message || "产物读取失败";
+        return null;
+      }),
     ]);
     state.workspaceStatus = statusPayload?.status || null;
     state.workspaceDiff = diffPayload?.diff || null;
+    if (artifactsPayload) {
+      state.artifacts = Array.isArray(artifactsPayload?.items) ? artifactsPayload.items : [];
+      if (state.currentArtifact && !state.artifacts.some((item) => item.id === state.currentArtifact.id)) {
+        state.currentArtifact = null;
+        state.artifactContent = null;
+      }
+      if (!state.currentArtifact && state.artifacts[0]) state.currentArtifact = state.artifacts[0];
+    }
   } catch (error) {
     state.workspaceError = error?.payload?.message || error?.message || "工作区读取失败";
   } finally {
@@ -2197,6 +2464,23 @@ function appendTerminalOutputToPrompt() {
   }
 }
 
+function renderArtifactsOnly() {
+  const panels = Array.from(document.querySelectorAll("[data-artifact-panel]"));
+  if (!panels.length) {
+    return false;
+  }
+  for (const panel of panels) {
+    const context = panel.getAttribute("data-artifact-panel") || "workspace";
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = renderArtifactPanel(context).trim();
+    const nextPanel = wrapper.firstElementChild;
+    if (!nextPanel) continue;
+    panel.replaceWith(nextPanel);
+    bindApp(nextPanel);
+  }
+  return true;
+}
+
 function renderTerminalOnly() {
   const panel = document.querySelector(".workspace-terminal");
   if (!panel) {
@@ -2230,6 +2514,14 @@ function resetTerminalState() {
   state.terminalOutput = "";
   state.terminalError = "";
   state.terminalLoading = false;
+}
+
+function resetArtifactState() {
+  state.artifacts = [];
+  state.currentArtifact = null;
+  state.artifactContent = null;
+  state.artifactLoading = false;
+  state.artifactError = "";
 }
 
 async function streamTerminalEvents(terminalId) {
@@ -2571,8 +2863,10 @@ async function selectSession(sessionId) {
   state.statusTone = "warn";
   stopStream();
   resetTerminalState();
+  resetArtifactState();
   render();
   await refreshCurrentSession();
+  void refreshArtifacts({ silent: true });
 }
 
 async function refreshCurrentSession({ silent = false } = {}) {
@@ -2872,6 +3166,7 @@ async function recoverActiveTurnAfterForeground() {
 async function openNewSession() {
   stopStream();
   resetTerminalState();
+  resetArtifactState();
   state.currentSession = null;
   state.sessionId = "";
   state.draftSessionActive = true;
@@ -2944,6 +3239,7 @@ async function sendPrompt(event) {
       state.sessionId = turn.session.id || state.sessionId;
       state.currentSession = turn.session;
       upsertSession(turn.session);
+      void refreshArtifacts({ silent: true });
       state.timeline = hydrateTimelineFromSession(turn.session);
       const nextStatus = statusFromSession(turn.session);
       state.status = nextStatus.status;
@@ -3704,6 +4000,15 @@ function workspaceLabel() {
     || state.defaultCwd
     || firstSessionCwd()
     || "服务器默认目录";
+}
+
+function currentSessionId() {
+  return state.currentSession?.id || state.sessionId || "";
+}
+
+function artifactFileName(artifact) {
+  const displayPath = String(artifact?.displayPath || artifact?.title || "artifact").replace(/\\/g, "/");
+  return displayPath.split("/").filter(Boolean).pop() || "artifact";
 }
 
 function firstSessionCwd() {

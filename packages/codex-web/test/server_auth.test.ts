@@ -6,6 +6,7 @@ import test from 'node:test';
 import { FileIdentityStore } from '../src/identity_store.js';
 import { createCodexWebServer } from '../src/server.js';
 import { CodexWebWorkspaceEventBus } from '../src/workspace_event_bus.js';
+import { FileArtifactStore } from '../src/artifact_store.js';
 
 interface TestConfig {
   host: string;
@@ -244,6 +245,171 @@ test('GET /api/sessions/:sessionId/workspace/files rejects path traversal', asyn
   } finally {
     await server.stop();
     await fs.rm(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/sessions/:sessionId/artifacts lists session project and report artifacts', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-artifacts-'));
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-project-'));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    await fs.rm(projectDir, { recursive: true, force: true });
+  });
+  await fs.mkdir(path.join(projectDir, 'dist'), { recursive: true });
+  await fs.writeFile(path.join(projectDir, 'README.md'), '# Project\n', 'utf8');
+  await fs.writeFile(path.join(projectDir, 'dist', 'result.pdf'), '%PDF-1.4\n', 'utf8');
+  await fs.mkdir(path.join(stateDir, 'reports', 'project-a'), { recursive: true });
+  await fs.writeFile(path.join(stateDir, 'reports', 'project-a', 'summary.md'), '# Summary\n', 'utf8');
+
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({ id: 'thread_1', cwd: projectDir, projectId: 'project-a' }),
+    } as any,
+    config: createConfig({ stateDir }),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/sessions/thread_1/artifacts`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+
+    assert.equal(response.status, 200);
+    const payload = await response.json() as { items: Array<{ source: string; displayPath: string; kind: string }> };
+    assert.deepEqual(payload.items.map((item) => ({
+      source: item.source,
+      displayPath: item.displayPath,
+      kind: item.kind,
+    })), [
+      { source: 'project', displayPath: 'README.md', kind: 'markdown' },
+      { source: 'project', displayPath: 'dist/result.pdf', kind: 'pdf' },
+      { source: 'report', displayPath: 'project-a/summary.md', kind: 'markdown' },
+    ]);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('GET /api/sessions/:sessionId/artifacts/:artifactId/content previews text and downloads binary', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-artifacts-'));
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-project-'));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    await fs.rm(projectDir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(projectDir, 'notes.txt'), 'hello artifact\n', 'utf8');
+  const artifactId = FileArtifactStore.projectArtifactId('notes.txt');
+
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({ id: 'thread_1', cwd: projectDir }),
+    } as any,
+    config: createConfig({ stateDir }),
+  });
+  await server.start();
+  try {
+    const content = await fetch(`${server.baseUrl}/api/sessions/thread_1/artifacts/${encodeURIComponent(artifactId)}/content`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(content.status, 200);
+    const contentPayload = await content.json() as { kind: string; content: string; artifact: { displayPath: string } };
+    assert.equal(contentPayload.kind, 'text');
+    assert.equal(contentPayload.content, 'hello artifact\n');
+    assert.equal(contentPayload.artifact.displayPath, 'notes.txt');
+
+    const download = await fetch(`${server.baseUrl}/api/sessions/thread_1/artifacts/${encodeURIComponent(artifactId)}/download`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(download.status, 200);
+    assert.equal(download.headers.get('content-type'), 'text/plain; charset=utf-8');
+    assert.match(download.headers.get('content-disposition') ?? '', /filename="notes\.txt"/u);
+    assert.equal(await download.text(), 'hello artifact\n');
+  } finally {
+    await server.stop();
+  }
+});
+
+test('PATCH /api/sessions/:sessionId/artifacts/:artifactId/favorite persists favorite state', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-artifacts-'));
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-project-'));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    await fs.rm(projectDir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(projectDir, 'notes.txt'), 'hello\n', 'utf8');
+  const artifactId = FileArtifactStore.projectArtifactId('notes.txt');
+
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({ id: 'thread_1', cwd: projectDir }),
+    } as any,
+    config: createConfig({ stateDir }),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/sessions/thread_1/artifacts/${encodeURIComponent(artifactId)}/favorite`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: 'Bearer cw_token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ favorite: true }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(((await response.json()) as { artifact: { favorite: boolean } }).artifact.favorite, true);
+
+    const list = await fetch(`${server.baseUrl}/api/sessions/thread_1/artifacts`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(list.status, 200);
+    const payload = await list.json() as { items: Array<{ id: string; favorite: boolean }> };
+    assert.equal(payload.items.find((item) => item.id === artifactId)?.favorite, true);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('GET /api/sessions/:sessionId/artifacts/:artifactId/content rejects project symlink escapes', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-artifacts-'));
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-project-'));
+  const outside = path.join(stateDir, 'outside.txt');
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    await fs.rm(projectDir, { recursive: true, force: true });
+  });
+  await fs.writeFile(outside, 'secret\n', 'utf8');
+  try {
+    await fs.symlink(outside, path.join(projectDir, 'leak.txt'));
+  } catch (error: any) {
+    if (process.platform === 'win32' && error?.code === 'EPERM') {
+      t.skip('Windows symlink creation requires developer mode or elevated privileges.');
+      return;
+    }
+    throw error;
+  }
+
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({ id: 'thread_1', cwd: projectDir }),
+    } as any,
+    config: createConfig({ stateDir }),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/sessions/thread_1/artifacts/${encodeURIComponent(FileArtifactStore.projectArtifactId('leak.txt'))}/content`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(response.status, 403);
+    assert.equal(((await response.json()) as { error: string }).error, 'artifact_path_forbidden');
+  } finally {
+    await server.stop();
   }
 });
 
