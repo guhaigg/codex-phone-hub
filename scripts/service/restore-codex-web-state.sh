@@ -111,8 +111,12 @@ restore_archive_to_path() {
   local tmp_dir
   tmp_dir="$(mktemp -d "${parent}/.codex-web-restore.XXXXXX")"
   tar -xzf "${archive}" -C "${tmp_dir}"
+  local archive_listing
+  archive_listing="$(tar -tzf "${archive}")"
+  local archive_first
+  archive_first="${archive_listing%%$'\n'*}"
   local archive_root
-  archive_root="$(tar -tzf "${archive}" | head -n 1 | cut -d/ -f1)"
+  archive_root="${archive_first%%/*}"
   local extracted="${tmp_dir}/${archive_root}"
   if [[ ! -e "${extracted}" ]]; then
     rm -rf "${tmp_dir}"
