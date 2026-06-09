@@ -1,0 +1,32 @@
+{
+  "name": "@codex-phone-hub/codex-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted mobile web console for controlling local Codex from a phone.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "codex-web": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "serve": "node --conditions=development --import tsx src/cli.ts serve",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/auth_store.test.ts test/cli.test.ts test/config.test.ts test/event_bus.test.ts test/events.test.ts test/hybrid_auth_store.test.ts test/identity_store.test.ts test/install_docs.test.ts test/launchd_scripts.test.ts test/report_store.test.ts test/runtime_resolution.test.ts test/runtime.test.ts test/server_auth.test.ts test/server_multi_user.test.ts test/session_settings_store.test.ts",
+    "test:ui": "tsx --test test/public_ui.test.ts"
+  },
+  "dependencies": {
+    "@codex-phone-hub/codex-native-api": "0.1.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
