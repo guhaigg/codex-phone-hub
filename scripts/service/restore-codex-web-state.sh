@@ -76,7 +76,7 @@ service_status() {
 }
 
 status="$(service_status | head -n 1 | tr -d '\r')"
-if [[ "${FORCE}" -ne 1 && "${status}" == "active" ]]; then
+if [[ "${DRY_RUN}" -ne 1 && "${FORCE}" -ne 1 && "${status}" == "active" ]]; then
   echo "service ${SERVICE_NAME} is active; stop it first or pass --force." >&2
   exit 1
 fi

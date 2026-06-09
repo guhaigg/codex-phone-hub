@@ -69,7 +69,7 @@ test('backup restore and rollback scripts recover state, service env, and source
       '--state-dir', stateDir,
       '--env-path', envPath,
       '--dry-run',
-    ], { CODEX_WEB_RESTORE_SERVICE_STATUS: 'inactive' });
+    ], { CODEX_WEB_RESTORE_SERVICE_STATUS: 'active' });
     requireSuccess(dryRestore);
     assert.equal(await fs.readFile(path.join(stateDir, 'auth.json'), 'utf8'), '{"token":"after"}\n');
     assert.equal(await fs.readFile(envPath, 'utf8'), 'CODEX_WEB_PORT=9999\n');
