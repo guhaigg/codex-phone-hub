@@ -737,7 +737,7 @@ export class CodexAppClient extends EventEmitter {
   }): Promise<void> {
     await this.request('turn/steer', {
       threadId,
-      turnId,
+      expectedTurnId: turnId,
       input: Array.isArray(input) && input.length > 0
         ? input
         : [{

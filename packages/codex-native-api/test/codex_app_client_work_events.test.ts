@@ -33,7 +33,7 @@ test('app client steers a running turn through the app-server turn/steer RPC', a
     method: 'turn/steer',
     params: {
       threadId: 'thread_1',
-      turnId: 'turn_1',
+      expectedTurnId: 'turn_1',
       input,
     },
   }]);

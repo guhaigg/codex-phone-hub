@@ -1055,7 +1055,7 @@ function renderCapabilities(mobile) {
     ["目标与命令", "/status · /model · /plan", "远程工作台命令可直接插入输入框", "code", "chat"],
     ["报告", `${state.reports.length || "未加载"} 个`, "查看任务沉淀、帮助文档和报告内容", "doc", "reports"],
     ["运行时", usageText(), "刷新用量、重载运行时、清理缓存", "refresh", "settings"],
-    ["用户与项目", state.admin.settings ? `${state.admin.users.length} 用户 · ${state.admin.projects.length} 项目` : "点击加载", "管理用户、角色、项目和多用户状态", "user", "admin"],
+    ["项目与服务", state.admin.settings ? `${state.admin.projects.length} 个项目` : "点击加载", "管理个人项目目录和服务状态", "folder", "admin"],
   ];
   return `
     <section class="capabilities-page workbench-page">
@@ -1194,7 +1194,7 @@ function renderAdmin(mobile) {
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div>
           <h1>管理</h1>
-          <p>用户、角色、项目和多用户开关</p>
+          <p>个人服务、项目目录和运行维护</p>
         </div>
         <button class="icon-btn" id="refresh-admin" title="刷新">${icon("refresh")}</button>
       </header>
@@ -1209,151 +1209,33 @@ function renderAdminBody() {
     <div class="admin-layout">
       ${state.notice ? `<div class="notice-line settings-notice">${escapeHtml(state.notice)}</div>` : ""}
       <section class="open-section">
-        <div class="section-kicker">系统</div>
-        ${renderAdminSettingsForm(settings)}
+        <div class="section-kicker">个人服务</div>
+        ${renderPersonalAdminSummary(settings)}
         ${settingStatic("站点", settings.siteTitle || state.siteTitle, "link")}
-      </section>
-      <section class="open-section">
-        <div class="section-kicker">用户</div>
-        ${renderAdminUserForm()}
-        ${state.admin.users.length ? state.admin.users.map((user) => `
-          ${renderAdminUserForm(user)}
-        `).join("") : `<p class="muted">暂无用户</p>`}
       </section>
       <section class="open-section">
         <div class="section-kicker">项目</div>
         ${renderAdminProjectForm()}
         ${state.admin.projects.length ? state.admin.projects.map((project) => `
           ${renderAdminProjectForm(project)}
-        `).join("") : `<p class="muted">暂无项目。当前是单用户模式时可以直接创建默认会话。</p>`}
-      </section>
-      <section class="open-section">
-        <div class="section-kicker">角色</div>
-        ${renderAdminRoleForm()}
-        ${state.admin.roles.map((role) => `
-          ${renderAdminRoleForm(role)}
-        `).join("")}
+        `).join("") : `<p class="muted">暂无项目。当前是个人模式，可以直接创建默认会话。</p>`}
       </section>
     </div>
   `;
 }
 
-function renderAdminRoleForm(role = null) {
-  const isExisting = Boolean(role?.id);
-  const id = role?.id || "";
-  const grants = Array.isArray(role?.projectGrants) ? role.projectGrants : [];
+function renderPersonalAdminSummary(settings) {
+  const mode = "个人使用";
   return `
-    <form class="admin-project-form admin-role-form" data-admin-role-form="${escapeAttribute(id)}">
+    <div class="admin-project-form admin-system-form">
       <div class="admin-form-head">
         <span>
-          <strong>${escapeHtml(isExisting ? (role.name || role.id) : "新增角色")}</strong>
-          <small>${escapeHtml(isExisting ? `${role.isAdmin ? "管理员" : "普通角色"} · ${grants.length} 个项目授权` : "用项目授权控制会话读写和创建权限")}</small>
+          <strong>访问模式</strong>
+          <small>${escapeHtml(mode)}</small>
         </span>
+        <span class="status-badge green">简化</span>
       </div>
-      <div class="admin-form-grid">
-        <label>
-          <span>角色 ID</span>
-          <input name="id" value="${escapeAttribute(id)}" placeholder="role_developer" ${isExisting ? "disabled" : ""}>
-        </label>
-        <label>
-          <span>名称</span>
-          <input name="name" value="${escapeAttribute(role?.name || "")}" placeholder="开发协作者">
-        </label>
-      </div>
-      ${renderRoleGrantMatrix(grants)}
-      <div class="action-line">
-        <button class="ghost-action" type="submit" ${state.adminSaving ? "disabled" : ""}>${isExisting ? "保存角色" : "创建角色"}</button>
-      </div>
-    </form>
-  `;
-}
-
-function renderRoleGrantMatrix(grants) {
-  const projects = state.admin.projects || [];
-  if (!projects.length) return `<p class="muted">还没有项目，先创建项目再授权。</p>`;
-  return `
-    <div class="role-grant-list">
-      ${projects.map((project) => {
-        const grant = grants.find((item) => item.projectId === project.id) || {};
-        return `
-          <div class="role-grant-row" data-project-id="${escapeAttribute(project.id)}">
-            <span>
-              <strong>${escapeHtml(project.displayName || project.internalName || project.id)}</strong>
-              <small>${escapeHtml(project.cwd || project.id)}</small>
-            </span>
-            <label><input type="checkbox" name="grant:${escapeAttribute(project.id)}:canRead" ${grant.canRead ? "checked" : ""}> 读</label>
-            <label><input type="checkbox" name="grant:${escapeAttribute(project.id)}:canCreate" ${grant.canCreate ? "checked" : ""}> 建</label>
-            <label><input type="checkbox" name="grant:${escapeAttribute(project.id)}:canWrite" ${grant.canWrite ? "checked" : ""}> 写</label>
-          </div>
-        `;
-      }).join("")}
     </div>
-  `;
-}
-
-function renderAdminSettingsForm(settings) {
-  const multiUserEnabled = settings.multiUserEnabled === true;
-  return `
-    <form class="admin-project-form admin-system-form" id="admin-settings-form">
-      <div class="admin-form-head">
-        <span>
-          <strong>多用户</strong>
-          <small>${escapeHtml(multiUserEnabled ? "已开启：按用户、角色、项目授权访问" : "未开启：当前使用本地管理员单用户模式")}</small>
-        </span>
-        <label class="switch-row">
-          <input type="checkbox" name="multiUserEnabled" ${multiUserEnabled ? "checked" : ""}>
-          <span>${multiUserEnabled ? "开启" : "关闭"}</span>
-        </label>
-      </div>
-      <div class="action-line">
-        <button class="ghost-action" type="submit" ${state.adminSaving ? "disabled" : ""}>保存多用户开关</button>
-      </div>
-    </form>
-  `;
-}
-
-function renderAdminUserForm(user = null) {
-  const isExisting = Boolean(user?.id);
-  const id = user?.id || "";
-  const enabled = user?.enabled !== false;
-  return `
-    <form class="admin-project-form admin-user-form" data-admin-user-form="${escapeAttribute(id)}">
-      <div class="admin-form-head">
-        <span>
-          <strong>${escapeHtml(isExisting ? user.username : "新增用户")}</strong>
-          <small>${escapeHtml(isExisting ? `${enabled ? "启用" : "停用"} · ${roleLabel(user.roleId || user.roleIds?.[0] || "")}` : "创建后可登录远程工作台")}</small>
-        </span>
-        <label class="switch-row">
-          <input type="checkbox" name="enabled" ${enabled ? "checked" : ""}>
-          <span>启用</span>
-        </label>
-      </div>
-      <div class="admin-form-grid">
-        <label>
-          <span>用户名</span>
-          <input name="username" value="${escapeAttribute(user?.username || "")}" placeholder="developer" ${isExisting ? "disabled" : ""}>
-        </label>
-        <label>
-          <span>邮箱</span>
-          <input name="email" value="${escapeAttribute(user?.email || "")}" placeholder="可选">
-        </label>
-        <label>
-          <span>角色</span>
-          <select name="roleId">
-            ${roleOptions(user?.roleId || user?.roleIds?.[0] || "role_admin")}
-          </select>
-        </label>
-        ${isExisting ? "" : `
-          <label>
-            <span>初始密码</span>
-            <input name="password" type="password" autocomplete="new-password" placeholder="至少 8 位">
-          </label>
-        `}
-      </div>
-      <div class="action-line">
-        <button class="ghost-action" type="submit" ${state.adminSaving ? "disabled" : ""}>${isExisting ? "保存用户" : "创建用户"}</button>
-      </div>
-    </form>
   `;
 }
 
@@ -1369,7 +1251,7 @@ function renderAdminProjectForm(project = null) {
       <div class="admin-form-head">
         <span>
           <strong>${escapeHtml(isExisting ? (project.displayName || project.internalName || project.id) : "新增项目")}</strong>
-          <small>${escapeHtml(isExisting ? (enabled ? "启用" : "停用") : "创建后可用于多用户项目会话")}</small>
+          <small>${escapeHtml(isExisting ? (enabled ? "启用" : "停用") : "添加一个常用 Codex 工作目录")}</small>
         </span>
         <label class="switch-row">
           <input type="checkbox" name="enabled" ${enabled ? "checked" : ""}>
@@ -1449,13 +1331,6 @@ function bindApp() {
   document.querySelector("#cap-new-session")?.addEventListener("click", openNewSession);
   document.querySelector("#refresh-reports")?.addEventListener("click", () => refreshReports());
   document.querySelector("#refresh-admin")?.addEventListener("click", () => refreshAdmin());
-  document.querySelector("#admin-settings-form")?.addEventListener("submit", saveAdminSettings);
-  for (const form of document.querySelectorAll("[data-admin-user-form]")) {
-    form.addEventListener("submit", saveAdminUser);
-  }
-  for (const form of document.querySelectorAll("[data-admin-role-form]")) {
-    form.addEventListener("submit", saveAdminRole);
-  }
   for (const form of document.querySelectorAll("[data-admin-project-form]")) {
     form.addEventListener("submit", saveAdminProject);
   }
@@ -1799,17 +1674,15 @@ async function refreshAdmin() {
   state.adminLoading = true;
   render();
   try {
-    const [settings, projects, roles, users] = await Promise.all([
+    const [settings, projects] = await Promise.all([
       apiFetch("/api/admin/settings").catch(() => null),
       apiFetch("/api/admin/projects").catch(() => ({ items: [] })),
-      apiFetch("/api/admin/roles").catch(() => ({ items: [] })),
-      apiFetch("/api/admin/users").catch(() => ({ items: [] })),
     ]);
     state.admin = {
       settings: settings?.settings || null,
       projects: Array.isArray(projects?.items) ? projects.items : [],
-      roles: Array.isArray(roles?.items) ? roles.items : [],
-      users: Array.isArray(users?.items) ? users.items : [],
+      roles: [],
+      users: [],
     };
   } finally {
     state.adminLoading = false;
@@ -2524,117 +2397,6 @@ async function reloadRuntime() {
   render();
 }
 
-async function saveAdminSettings(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  state.adminSaving = true;
-  state.notice = "";
-  render();
-  try {
-    const payload = await apiFetch("/api/admin/settings", {
-      method: "PATCH",
-      body: { multiUserEnabled: new FormData(form).get("multiUserEnabled") === "on" },
-    });
-    if (payload?.settings) state.admin.settings = payload.settings;
-    state.notice = "多用户设置已保存";
-    await refreshAdmin({ silent: true });
-  } catch (error) {
-    state.notice = error?.payload?.message || error?.message || "多用户设置保存失败";
-  } finally {
-    state.adminSaving = false;
-    render();
-  }
-}
-
-async function saveAdminUser(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const userId = String(form?.getAttribute("data-admin-user-form") || "").trim();
-  const data = new FormData(form);
-  const roleId = String(data.get("roleId") || "").trim();
-  const payload = {
-    username: String(data.get("username") || "").trim(),
-    email: String(data.get("email") || "").trim(),
-    password: String(data.get("password") || ""),
-    enabled: data.get("enabled") === "on",
-    roleId,
-    roleIds: roleId ? [roleId] : [],
-  };
-  if (!userId && !payload.username) {
-    state.notice = "用户名不能为空";
-    render();
-    return;
-  }
-  if (!userId && payload.password.length < 8) {
-    state.notice = "初始密码至少 8 位";
-    render();
-    return;
-  }
-  state.adminSaving = true;
-  state.notice = "";
-  render();
-  try {
-    const endpoint = userId ? `/api/admin/users/${encodeURIComponent(userId)}` : "/api/admin/users";
-    const body = userId
-      ? { email: payload.email, enabled: payload.enabled, roleId: payload.roleId, roleIds: payload.roleIds }
-      : payload;
-    await apiFetch(endpoint, {
-      method: userId ? "PATCH" : "POST",
-      body,
-    });
-    state.notice = userId ? "用户已保存" : "用户已创建";
-    await refreshAdmin({ silent: true });
-  } catch (error) {
-    state.notice = error?.payload?.message || error?.message || "用户保存失败";
-  } finally {
-    state.adminSaving = false;
-    render();
-  }
-}
-
-async function saveAdminRole(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const roleId = String(form?.getAttribute("data-admin-role-form") || "").trim();
-  const data = new FormData(form);
-  const name = String(data.get("name") || "").trim();
-  let id = String(data.get("id") || "").trim() || roleId;
-  if (!id && name) {
-    id = `role_${name.toLowerCase().replace(/[^a-z0-9_-]+/gu, "-").replace(/^-+|-+$/gu, "")}`;
-  }
-  if (!id) {
-    state.notice = "角色 ID 或名称不能为空";
-    render();
-    return;
-  }
-  const projectGrants = state.admin.projects.map((project) => ({
-    projectId: project.id,
-    canRead: data.get(`grant:${project.id}:canRead`) === "on",
-    canCreate: data.get(`grant:${project.id}:canCreate`) === "on",
-    canWrite: data.get(`grant:${project.id}:canWrite`) === "on",
-  })).filter((grant) => grant.canRead || grant.canCreate || grant.canWrite);
-  state.adminSaving = true;
-  state.notice = "";
-  render();
-  try {
-    await apiFetch("/api/admin/roles", {
-      method: "POST",
-      body: {
-        id,
-        name: name || id,
-        projectGrants,
-      },
-    });
-    state.notice = roleId ? "角色已保存" : "角色已创建";
-    await refreshAdmin({ silent: true });
-  } catch (error) {
-    state.notice = error?.payload?.message || error?.message || "角色保存失败";
-  } finally {
-    state.adminSaving = false;
-    render();
-  }
-}
-
 async function saveAdminProject(event) {
   event.preventDefault();
   const form = event.currentTarget;
@@ -3150,20 +2912,6 @@ function collaborationOptions() {
 
 function personalityOptions() {
   return [["pragmatic", "务实"], ["friendly", "友好"], ["none", "无"]];
-}
-
-function roleOptions(selectedRoleId = "") {
-  const roles = state.admin.roles.length ? state.admin.roles : [{ id: "role_admin", name: "Admin", isAdmin: true }];
-  return roles.map((role) => {
-    const id = role.id || "";
-    const label = role.name || role.id || "角色";
-    return `<option value="${escapeAttribute(id)}" ${id === selectedRoleId ? "selected" : ""}>${escapeHtml(label)}</option>`;
-  }).join("");
-}
-
-function roleLabel(roleId) {
-  const role = state.admin.roles.find((item) => item.id === roleId);
-  return role?.name || roleId || "未分配角色";
 }
 
 function loadDefaultThreadSettings() {
