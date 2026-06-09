@@ -6,7 +6,14 @@ import {
   createStderrLogger,
   type CodexTurnInput,
   type ProviderApprovalRequest,
+  type ProviderAppInfo,
+  type ProviderMcpOauthLoginResult,
+  type ProviderMcpServerStatus,
   type ProviderModelInfo,
+  type ProviderPluginDetail,
+  type ProviderPluginInstallResult,
+  type ProviderPluginsListResult,
+  type ProviderSkillsListResult,
   type ProviderThreadGoal,
   type ProviderThreadListResult,
   type ProviderThreadStartResult,
@@ -115,6 +122,29 @@ export interface CodexWebRuntimeClient {
   clearThreadGoal?(threadId: string): Promise<boolean>;
   archiveThread?(threadId: string): Promise<void>;
   unarchiveThread?(threadId: string): Promise<void>;
+  listSkills?(args?: { cwd?: string | null; forceReload?: boolean }): Promise<ProviderSkillsListResult>;
+  setSkillEnabled?(args: { enabled: boolean; name?: string | null; path?: string | null }): Promise<void>;
+  listPlugins?(args?: { cwd?: string | null }): Promise<ProviderPluginsListResult>;
+  readPlugin?(args: {
+    pluginName: string;
+    marketplaceName?: string | null;
+    marketplacePath?: string | null;
+  }): Promise<ProviderPluginDetail | null>;
+  installPlugin?(args: {
+    pluginName: string;
+    marketplaceName?: string | null;
+    marketplacePath?: string | null;
+  }): Promise<ProviderPluginInstallResult>;
+  uninstallPlugin?(args: { pluginId: string }): Promise<void>;
+  listApps?(): Promise<ProviderAppInfo[]>;
+  setAppEnabled?(args: { appId: string; enabled: boolean }): Promise<void>;
+  listMcpServerStatuses?(): Promise<ProviderMcpServerStatus[]>;
+  setMcpServerEnabled?(args: { name: string; enabled: boolean }): Promise<void>;
+  startMcpServerOauthLogin?(args: {
+    name: string;
+    scopes?: string[] | null;
+    timeoutSecs?: number | null;
+  }): Promise<ProviderMcpOauthLoginResult>;
   writeConfigValue(args: {
     keyPath: string;
     value: unknown;
@@ -480,6 +510,105 @@ export class CodexWebRuntime {
     return { mcpServersReloaded: true };
   }
 
+  async listSkills(args: { cwd?: string | null; forceReload?: boolean } = {}): Promise<ProviderSkillsListResult> {
+    if (typeof this.client.listSkills !== 'function') {
+      return { cwd: args.cwd ?? null, skills: [], errors: [] };
+    }
+    return this.client.listSkills(args);
+  }
+
+  async setSkillEnabled(args: { enabled: boolean; name?: string | null; path?: string | null }): Promise<void> {
+    if (typeof this.client.setSkillEnabled !== 'function') {
+      throw new Error('Skill configuration is not supported by this Codex runtime');
+    }
+    await this.client.setSkillEnabled(args);
+  }
+
+  async listPlugins(args: { cwd?: string | null } = {}): Promise<ProviderPluginsListResult> {
+    if (typeof this.client.listPlugins !== 'function') {
+      return { featuredPluginIds: [], marketplaceLoadErrors: [], marketplaces: [] };
+    }
+    return this.client.listPlugins(args);
+  }
+
+  async readPlugin(args: {
+    pluginName: string;
+    marketplaceName?: string | null;
+    marketplacePath?: string | null;
+  }): Promise<ProviderPluginDetail | null> {
+    if (typeof this.client.readPlugin !== 'function') {
+      return null;
+    }
+    return this.client.readPlugin(args);
+  }
+
+  async installPlugin(args: {
+    pluginName: string;
+    marketplaceName?: string | null;
+    marketplacePath?: string | null;
+  }): Promise<ProviderPluginInstallResult> {
+    if (typeof this.client.installPlugin !== 'function') {
+      throw new Error('Plugin installation is not supported by this Codex runtime');
+    }
+    return this.client.installPlugin(args);
+  }
+
+  async uninstallPlugin(args: { pluginId: string }): Promise<void> {
+    if (typeof this.client.uninstallPlugin !== 'function') {
+      throw new Error('Plugin uninstall is not supported by this Codex runtime');
+    }
+    await this.client.uninstallPlugin(args);
+  }
+
+  async listApps(): Promise<ProviderAppInfo[]> {
+    if (typeof this.client.listApps !== 'function') {
+      return [];
+    }
+    return this.client.listApps();
+  }
+
+  async setAppEnabled(args: { appId: string; enabled: boolean }): Promise<void> {
+    if (typeof this.client.setAppEnabled !== 'function') {
+      throw new Error('App configuration is not supported by this Codex runtime');
+    }
+    await this.client.setAppEnabled(args);
+  }
+
+  async listMcpServerStatuses(): Promise<ProviderMcpServerStatus[]> {
+    if (typeof this.client.listMcpServerStatuses !== 'function') {
+      return [];
+    }
+    return this.client.listMcpServerStatuses();
+  }
+
+  async setMcpServerEnabled(args: { name: string; enabled: boolean }): Promise<void> {
+    if (typeof this.client.setMcpServerEnabled !== 'function') {
+      throw new Error('MCP server configuration is not supported by this Codex runtime');
+    }
+    await this.client.setMcpServerEnabled(args);
+  }
+
+  async startMcpServerOauthLogin(args: {
+    name: string;
+    scopes?: string[] | null;
+    timeoutSecs?: number | null;
+  }): Promise<ProviderMcpOauthLoginResult> {
+    if (typeof this.client.startMcpServerOauthLogin !== 'function') {
+      throw new Error('MCP OAuth login is not supported by this Codex runtime');
+    }
+    return this.client.startMcpServerOauthLogin(args);
+  }
+
+  async writeRuntimeConfigValue(args: {
+    keyPath: string;
+    value: unknown;
+    mergeStrategy?: 'replace' | 'upsert';
+    filePath?: string | null;
+    expectedVersion?: string | null;
+  }): Promise<void> {
+    await this.client.writeConfigValue(args);
+  }
+
   async startTurn(sessionId: string, input: StartTurnInput): Promise<CodexWebStartTurnResult> {
     const session = await this.readSession(sessionId);
     if (!session) {
@@ -707,11 +836,14 @@ export class CodexWebRuntime {
         message: '当前 Codex runtime 还不支持从 Web fork thread。',
       }) as CodexWebCommandResult;
     }
-    if (command.name === 'mcp' || command.name === 'skills' || command.name === 'plugins') {
-      return createSimpleCommandResult({
-        name: command.name,
-        message: `${command.name} 摘要接口将在生态管理模块接入。`,
-      }) as CodexWebCommandResult;
+    if (command.name === 'mcp') {
+      return this.handleMcpCommand();
+    }
+    if (command.name === 'skills') {
+      return this.handleSkillsCommand(session);
+    }
+    if (command.name === 'plugins') {
+      return this.handlePluginsCommand(session);
     }
     return createSimpleCommandResult({
       name: 'unknown',
@@ -916,6 +1048,50 @@ export class CodexWebRuntime {
       }),
       session: await this.readSession(threadId),
     } as CodexWebCommandResult;
+  }
+
+  private async handleSkillsCommand(session: CodexWebSession): Promise<CodexWebCommandResult> {
+    const result = await this.listSkills({ cwd: session.cwd ?? this.defaultCwd });
+    const enabled = result.skills.filter((skill) => skill.enabled === true);
+    const disabled = result.skills.length - enabled.length;
+    return createSimpleCommandResult({
+      name: 'skills',
+      message: [
+        `Skills: ${result.skills.length} total, ${enabled.length} enabled, ${disabled} disabled`,
+        enabled.length ? `Enabled: ${enabled.slice(0, 8).map((skill) => skill.name).join(', ')}` : 'Enabled: none',
+        result.errors.length ? `Errors: ${result.errors.length}` : 'Errors: none',
+      ].join('\n'),
+    }) as CodexWebCommandResult;
+  }
+
+  private async handlePluginsCommand(session: CodexWebSession): Promise<CodexWebCommandResult> {
+    const result = await this.listPlugins({ cwd: session.cwd ?? this.defaultCwd });
+    const plugins = result.marketplaces.flatMap((marketplace) => marketplace.plugins);
+    const installed = plugins.filter((plugin) => plugin.installed === true);
+    const enabled = plugins.filter((plugin) => plugin.enabled === true);
+    return createSimpleCommandResult({
+      name: 'plugins',
+      message: [
+        `Plugins: ${plugins.length} total, ${installed.length} installed, ${enabled.length} enabled`,
+        installed.length ? `Installed: ${installed.slice(0, 8).map((plugin) => plugin.displayName || plugin.name).join(', ')}` : 'Installed: none',
+        result.marketplaceLoadErrors.length ? `Marketplace errors: ${result.marketplaceLoadErrors.length}` : 'Marketplace errors: none',
+      ].join('\n'),
+    }) as CodexWebCommandResult;
+  }
+
+  private async handleMcpCommand(): Promise<CodexWebCommandResult> {
+    const servers = await this.listMcpServerStatuses();
+    const enabled = servers.filter((server) => server.isEnabled === true);
+    const tools = servers.reduce((sum, server) => sum + (Number.isFinite(server.toolCount) ? server.toolCount : 0), 0);
+    const authNeeded = servers.filter((server) => String(server.authStatus || '').toLowerCase() === 'notloggedin');
+    return createSimpleCommandResult({
+      name: 'mcp',
+      message: [
+        `MCP: ${servers.length} servers, ${enabled.length} enabled, ${tools} tools`,
+        enabled.length ? `Enabled: ${enabled.slice(0, 8).map((server) => server.name).join(', ')}` : 'Enabled: none',
+        authNeeded.length ? `Needs auth: ${authNeeded.map((server) => server.name).join(', ')}` : 'Needs auth: none',
+      ].join('\n'),
+    }) as CodexWebCommandResult;
   }
 
   private requireGoalReader(): (threadId: string) => Promise<ProviderThreadGoal | null> {

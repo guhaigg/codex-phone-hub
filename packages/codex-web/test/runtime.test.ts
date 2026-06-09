@@ -1656,6 +1656,30 @@ test('runtime handles plan, resume, and ecosystem remote commands without starti
     resumeThread: async ({ threadId }) => {
       resumeThreadCalls.push(threadId);
     },
+    listSkills: async () => ({
+      cwd: '/workspace',
+      skills: [
+        { name: 'frontend-design', description: 'UI skill', enabled: true, path: '/skills/frontend-design', scope: 'user' },
+        { name: 'pdf', description: 'PDF skill', enabled: false, path: '/skills/pdf', scope: 'user' },
+      ],
+      errors: [],
+    }),
+    listPlugins: async () => ({
+      featuredPluginIds: ['plugin-a'],
+      marketplaceLoadErrors: [],
+      marketplaces: [{
+        name: 'personal',
+        path: '/plugins',
+        plugins: [
+          { id: 'plugin-a', name: 'plugin-a', installed: true, enabled: true, installPolicy: 'AVAILABLE', authPolicy: 'ON_USE', marketplaceName: 'personal', marketplacePath: '/plugins' },
+          { id: 'plugin-b', name: 'plugin-b', installed: false, enabled: false, installPolicy: 'AVAILABLE', authPolicy: 'ON_USE', marketplaceName: 'personal', marketplacePath: '/plugins' },
+        ],
+      }],
+    }),
+    listMcpServerStatuses: async () => [
+      { name: 'github', isEnabled: true, authStatus: 'oAuth', toolCount: 8, resourceCount: 1, resourceTemplateCount: 0 },
+      { name: 'figma', isEnabled: false, authStatus: 'notLoggedIn', toolCount: 0, resourceCount: 0, resourceTemplateCount: 0 },
+    ],
     writeConfigValue: async () => {},
     startTurn: async (): Promise<ProviderTurnResult> => {
       startTurnCalls += 1;
@@ -1698,7 +1722,7 @@ test('runtime handles plan, resume, and ecosystem remote commands without starti
     const result = await runtime.startTurn('thread_remote_commands', { text });
     assert.equal(result.type, 'command');
     assert.equal(result.command.name, text.slice(1));
-    assert.match(result.command.message, /摘要接口/u);
+    assert.doesNotMatch(result.command.message, /将在生态管理模块接入/u);
   }
 
   assert.equal(startTurnCalls, 0);

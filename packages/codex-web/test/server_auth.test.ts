@@ -1255,6 +1255,169 @@ test('GET /api/sessions/:id returns backend-managed timeline entries', async () 
   }
 });
 
+test('personal ecosystem API routes proxy runtime capabilities', async () => {
+  const calls: string[] = [];
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      listSkills: async (input: any) => {
+        calls.push(`listSkills:${input?.cwd}:${input?.forceReload}`);
+        return {
+          cwd: input?.cwd ?? null,
+          skills: [{ name: 'frontend-design', description: 'UI skill', enabled: true, path: '/skills/frontend-design', scope: 'user' }],
+          errors: [],
+        };
+      },
+      setSkillEnabled: async (input: any) => {
+        calls.push(`setSkill:${input.name}:${input.enabled}`);
+      },
+      listPlugins: async (input: any) => {
+        calls.push(`listPlugins:${input?.cwd}`);
+        return {
+          featuredPluginIds: ['plugin-a'],
+          marketplaceLoadErrors: [],
+          marketplaces: [{
+            name: 'personal',
+            path: '/plugins',
+            plugins: [{ id: 'plugin-a', name: 'plugin-a', installed: true, enabled: true, installPolicy: 'AVAILABLE', authPolicy: 'ON_USE', marketplaceName: 'personal', marketplacePath: '/plugins' }],
+          }],
+        };
+      },
+      readPlugin: async (input: any) => {
+        calls.push(`readPlugin:${input.pluginName}:${input.marketplaceName}`);
+        return {
+          summary: { id: 'plugin-a', name: input.pluginName, installed: true, enabled: true, installPolicy: 'AVAILABLE', authPolicy: 'ON_USE', marketplaceName: input.marketplaceName, marketplacePath: null },
+          marketplaceName: input.marketplaceName,
+          marketplacePath: null,
+          apps: [],
+          mcpServers: ['github'],
+          skills: [],
+        };
+      },
+      installPlugin: async (input: any) => {
+        calls.push(`installPlugin:${input.pluginName}:${input.marketplaceName}`);
+        return { authPolicy: 'ON_USE', appsNeedingAuth: [] };
+      },
+      uninstallPlugin: async (input: any) => {
+        calls.push(`uninstallPlugin:${input.pluginId}`);
+      },
+      listApps: async () => {
+        calls.push('listApps');
+        return [{ id: 'github', name: 'GitHub', isAccessible: true, isEnabled: false, pluginDisplayNames: ['plugin-a'] }];
+      },
+      setAppEnabled: async (input: any) => {
+        calls.push(`setApp:${input.appId}:${input.enabled}`);
+      },
+      listMcpServerStatuses: async () => {
+        calls.push('listMcp');
+        return [{ name: 'github', isEnabled: true, authStatus: 'oAuth', toolCount: 8, resourceCount: 1, resourceTemplateCount: 0 }];
+      },
+      setMcpServerEnabled: async (input: any) => {
+        calls.push(`setMcp:${input.name}:${input.enabled}`);
+      },
+      startMcpServerOauthLogin: async (input: any) => {
+        calls.push(`oauth:${input.name}:${input.scopes?.join(',')}`);
+        return { authorizationUrl: `https://auth.example/${input.name}` };
+      },
+      writeConfigValue: async (input: any) => {
+        calls.push(`config:${input.keyPath}:${input.mergeStrategy}`);
+      },
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const baseHeaders = { Authorization: 'Bearer cw_token' };
+
+    let response = await fetch(`${server.baseUrl}/api/skills?cwd=${encodeURIComponent('/repo')}&forceReload=true`, { headers: baseHeaders });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).skills[0].name, 'frontend-design');
+
+    response = await fetch(`${server.baseUrl}/api/skills`, {
+      method: 'PATCH',
+      headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'frontend-design', enabled: false }),
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${server.baseUrl}/api/plugins?cwd=${encodeURIComponent('/repo')}`, { headers: baseHeaders });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).marketplaces[0].plugins[0].id, 'plugin-a');
+
+    response = await fetch(`${server.baseUrl}/api/plugins/plugin-a?marketplaceName=personal`, { headers: baseHeaders });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).plugin.summary.name, 'plugin-a');
+
+    response = await fetch(`${server.baseUrl}/api/plugins/plugin-a/install`, {
+      method: 'POST',
+      headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ marketplaceName: 'personal' }),
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${server.baseUrl}/api/plugins/plugin-a/uninstall`, {
+      method: 'POST',
+      headers: baseHeaders,
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${server.baseUrl}/api/apps`, { headers: baseHeaders });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).items[0].id, 'github');
+
+    response = await fetch(`${server.baseUrl}/api/apps`, {
+      method: 'PATCH',
+      headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ appId: 'github', enabled: true }),
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${server.baseUrl}/api/mcp`, { headers: baseHeaders });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).items[0].name, 'github');
+
+    response = await fetch(`${server.baseUrl}/api/mcp`, {
+      method: 'PATCH',
+      headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'github', enabled: false }),
+    });
+    assert.equal(response.status, 200);
+
+    response = await fetch(`${server.baseUrl}/api/mcp/github/oauth/start`, {
+      method: 'POST',
+      headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scopes: ['repo'], timeoutSecs: 90 }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).authorizationUrl, 'https://auth.example/github');
+
+    response = await fetch(`${server.baseUrl}/api/config/value`, {
+      method: 'POST',
+      headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keyPath: 'model_provider', value: 'third-party', mergeStrategy: 'replace' }),
+    });
+    assert.equal(response.status, 200);
+
+    assert.deepEqual(calls, [
+      'listSkills:/repo:true',
+      'setSkill:frontend-design:false',
+      'listPlugins:/repo',
+      'readPlugin:plugin-a:personal',
+      'installPlugin:plugin-a:personal',
+      'uninstallPlugin:plugin-a',
+      'listApps',
+      'setApp:github:true',
+      'listMcp',
+      'setMcp:github:false',
+      'oauth:github:repo',
+      'config:model_provider:replace',
+    ]);
+  } finally {
+    await server.stop();
+  }
+});
+
 test('POST /api/sessions/:id/timeline appends authenticated system messages', async () => {
   const calls: Array<{ sessionId: string; entry: any }> = [];
   const server = createCodexWebServer({

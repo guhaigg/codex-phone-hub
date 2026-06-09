@@ -46,6 +46,19 @@ const state = {
   currentReport: null,
   reportContent: "",
   reportLoading: false,
+  ecosystem: {
+    loading: false,
+    loaded: false,
+    tab: "skills",
+    skills: { cwd: null, skills: [], errors: [] },
+    plugins: { featuredPluginIds: [], marketplaceLoadErrors: [], marketplaces: [] },
+    apps: [],
+    mcp: [],
+    oauthUrl: "",
+    configKey: "",
+    configValue: "",
+    error: "",
+  },
   usage: null,
   settings: null,
   permissions: {},
@@ -451,7 +464,6 @@ function renderNotebookSidebar() {
       ${sidebarNavButton("sessions", "对话", "message")}
       ${sidebarNavButton("capabilities", "工作台", "grid")}
       ${sidebarNavButton("reports", "报告", "clipboard")}
-      ${sidebarNavButton("admin", "管理", "layers")}
       ${sidebarNavButton("settings", "设置", "settings")}
     </nav>
     <section class="sidebar-section">
@@ -514,7 +526,7 @@ function initialForName(name) {
 function renderViewTabs(mobile) {
   const items = mobile
     ? [["sessions", "会话"], ["capabilities", "能力"], ["reports", "报告"], ["settings", "设置"]]
-    : [["sessions", "会话"], ["capabilities", "能力"], ["reports", "报告"], ["admin", "管理"], ["settings", "设置"]];
+    : [["sessions", "会话"], ["capabilities", "能力"], ["reports", "报告"], ["settings", "设置"]];
   return `<nav class="view-tabs">${items.map(([view, label]) => (
     `<button class="${state.view === view || (view === "sessions" && state.view === "chat") ? "active" : ""}" data-view="${view}">${label}</button>`
   )).join("")}</nav>`;
@@ -975,7 +987,7 @@ function renderSettings(mobile) {
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div>
           <h1>设置</h1>
-          <p>模型、权限、运行状态与管理入口</p>
+          <p>模型、权限、运行状态与个人维护</p>
         </div>
       </header>
       ${state.notice ? `<div class="notice-line settings-notice">${escapeHtml(state.notice)}</div>` : ""}
@@ -1055,7 +1067,7 @@ function renderCapabilities(mobile) {
     ["目标与命令", "/status · /model · /plan", "远程工作台命令可直接插入输入框", "code", "chat"],
     ["报告", `${state.reports.length || "未加载"} 个`, "查看任务沉淀、帮助文档和报告内容", "doc", "reports"],
     ["运行时", usageText(), "刷新用量、重载运行时、清理缓存", "refresh", "settings"],
-    ["项目与服务", state.admin.settings ? `${state.admin.projects.length} 个项目` : "点击加载", "管理个人项目目录和服务状态", "folder", "admin"],
+    ["项目与服务", state.admin.settings ? `${state.admin.projects.length} 个项目` : "点击加载", "维护个人项目目录和服务状态", "folder", "projects"],
   ];
   return `
     <section class="capabilities-page workbench-page">
@@ -1092,8 +1104,253 @@ function renderCapabilities(mobile) {
           ${remoteCommandButtons().map(([command, label]) => `<button type="button" data-command="${escapeAttribute(command)}"><strong>${escapeHtml(command)}</strong><small>${escapeHtml(label)}</small></button>`).join("")}
         </div>
       </section>
+      ${renderPersonalProjectsPanel()}
+      ${renderEcosystemPanel()}
     </section>
   `;
+}
+
+function renderPersonalProjectsPanel() {
+  const settings = state.admin.settings || {};
+  const visibleProjects = state.admin.projects.slice(0, 40);
+  const hiddenCount = Math.max(0, state.admin.projects.length - visibleProjects.length);
+  return `
+    <section class="open-section personal-projects-panel" id="personal-projects-panel">
+      <div class="ecosystem-head">
+        <div>
+          <div class="section-kicker">个人项目</div>
+          <p>常用 Codex 工作目录和会话上限</p>
+        </div>
+        <button class="ghost-action" type="button" id="refresh-admin">${state.adminLoading ? "刷新中..." : "刷新项目"}</button>
+      </div>
+      ${state.adminLoading ? renderReportLoading() : `
+        ${state.notice ? `<div class="notice-line settings-notice">${escapeHtml(state.notice)}</div>` : ""}
+        ${renderPersonalAdminSummary(settings)}
+        ${renderAdminProjectForm()}
+        ${visibleProjects.length ? visibleProjects.map((project) => renderAdminProjectForm(project)).join("") : `<p class="muted">暂无项目。当前是个人模式，可以直接创建默认会话。</p>`}
+        ${hiddenCount ? `<p class="muted">还有 ${hiddenCount} 个项目未在本页展开，避免页面过重。</p>` : ""}
+      `}
+    </section>
+  `;
+}
+
+function renderEcosystemPanel() {
+  const ecosystem = normalizeEcosystemState();
+  const tabs = [
+    ["skills", "Skills"],
+    ["plugins", "Plugins"],
+    ["mcp", "MCP"],
+    ["apps", "Apps"],
+    ["config", "Config"],
+  ];
+  return `
+    <section class="ecosystem-panel open-section">
+      <div class="ecosystem-head">
+        <div>
+          <div class="section-kicker">生态控制台</div>
+          <p>Skills、Plugins、MCP、Apps 和 Codex 配置</p>
+        </div>
+        <button class="ghost-action" type="button" id="refresh-ecosystem">${ecosystem.loading ? "刷新中..." : "刷新生态"}</button>
+      </div>
+      ${ecosystem.error ? `<div class="notice-line settings-notice">${escapeHtml(ecosystem.error)}</div>` : ""}
+      ${ecosystem.oauthUrl ? `
+        <div class="ecosystem-oauth">
+          <span>OAuth URL</span>
+          <a href="${escapeAttribute(ecosystem.oauthUrl)}" target="_blank" rel="noreferrer">${escapeHtml(ecosystem.oauthUrl)}</a>
+          <button class="ghost-action" type="button" data-copy-text="${escapeAttribute(ecosystem.oauthUrl)}">复制链接</button>
+        </div>
+      ` : ""}
+      <div class="ecosystem-metrics">
+        ${renderEcosystemMetric("Skills", ecosystem.skills.skills.length, sampleSkillNames(ecosystem))}
+        ${renderEcosystemMetric("Plugins", ecosystemPlugins(ecosystem).length, samplePluginNames(ecosystem))}
+        ${renderEcosystemMetric("MCP", ecosystem.mcp.length, sampleMcpNames(ecosystem))}
+        ${renderEcosystemMetric("Apps", ecosystem.apps.length, sampleAppNames(ecosystem))}
+      </div>
+      <div class="ecosystem-tabs">
+        ${tabs.map(([tab, label]) => `<button type="button" class="${ecosystem.tab === tab ? "active" : ""}" data-ecosystem-tab="${escapeAttribute(tab)}">${escapeHtml(label)}</button>`).join("")}
+      </div>
+      <div class="ecosystem-content">
+        ${ecosystem.loading && !ecosystem.loaded ? renderReportLoading() : renderEcosystemTab(ecosystem)}
+      </div>
+    </section>
+  `;
+}
+
+function normalizeEcosystemState() {
+  const ecosystem = state.ecosystem || {};
+  return {
+    loading: ecosystem.loading === true,
+    loaded: ecosystem.loaded === true,
+    tab: ["skills", "plugins", "mcp", "apps", "config"].includes(ecosystem.tab) ? ecosystem.tab : "skills",
+    skills: {
+      cwd: ecosystem.skills?.cwd || null,
+      skills: Array.isArray(ecosystem.skills?.skills) ? ecosystem.skills.skills : [],
+      errors: Array.isArray(ecosystem.skills?.errors) ? ecosystem.skills.errors : [],
+    },
+    plugins: {
+      featuredPluginIds: Array.isArray(ecosystem.plugins?.featuredPluginIds) ? ecosystem.plugins.featuredPluginIds : [],
+      marketplaceLoadErrors: Array.isArray(ecosystem.plugins?.marketplaceLoadErrors) ? ecosystem.plugins.marketplaceLoadErrors : [],
+      marketplaces: Array.isArray(ecosystem.plugins?.marketplaces) ? ecosystem.plugins.marketplaces : [],
+    },
+    apps: Array.isArray(ecosystem.apps) ? ecosystem.apps : [],
+    mcp: Array.isArray(ecosystem.mcp) ? ecosystem.mcp : [],
+    oauthUrl: String(ecosystem.oauthUrl || ""),
+    configKey: String(ecosystem.configKey || ""),
+    configValue: String(ecosystem.configValue || ""),
+    error: String(ecosystem.error || ""),
+  };
+}
+
+function renderEcosystemMetric(label, count, sample) {
+  return `
+    <div class="ecosystem-metric">
+      <strong>${escapeHtml(String(count))}</strong>
+      <span>${escapeHtml(label)}</span>
+      <small>${escapeHtml(sample || "未加载")}</small>
+    </div>
+  `;
+}
+
+function renderEcosystemTab(ecosystem) {
+  if (ecosystem.tab === "plugins") return renderPluginRows(ecosystem);
+  if (ecosystem.tab === "mcp") return renderMcpRows(ecosystem);
+  if (ecosystem.tab === "apps") return renderAppRows(ecosystem);
+  if (ecosystem.tab === "config") return renderConfigPanel(ecosystem);
+  return renderSkillRows(ecosystem);
+}
+
+function renderSkillRows(ecosystem) {
+  const skills = ecosystem.skills.skills.slice(0, 80);
+  if (!skills.length) return `<p class="muted ecosystem-empty">还没有读取到 Skills。</p>`;
+  return `
+    <div class="ecosystem-list">
+      ${skills.map((skill) => `
+        <div class="ecosystem-row">
+          <span class="setting-icon">${icon("sparkles")}</span>
+          <span>
+            <strong>${escapeHtml(skill.displayName || skill.name || "Skill")}</strong>
+            <small>${escapeHtml(skill.shortDescription || skill.description || skill.path || "")}</small>
+          </span>
+          <em>${escapeHtml(skill.scope || "user")}</em>
+          <button class="ghost-action" type="button" data-skill-toggle="${escapeAttribute(skill.name || "")}" data-skill-enabled="${skill.enabled ? "false" : "true"}">${skill.enabled ? "停用" : "启用"}</button>
+        </div>
+      `).join("")}
+    </div>
+    ${ecosystem.skills.errors.length ? `<div class="ecosystem-errors">${escapeHtml(`${ecosystem.skills.errors.length} 个 Skill 读取错误`)}</div>` : ""}
+  `;
+}
+
+function renderPluginRows(ecosystem) {
+  const plugins = ecosystemPlugins(ecosystem).slice(0, 80);
+  if (!plugins.length) return `<p class="muted ecosystem-empty">还没有读取到 Plugins。</p>`;
+  return `
+    <div class="ecosystem-list">
+      ${plugins.map((plugin) => `
+        <div class="ecosystem-row">
+          <span class="setting-icon">${icon("layers")}</span>
+          <span>
+            <strong>${escapeHtml(plugin.displayName || plugin.name || plugin.id || "Plugin")}</strong>
+            <small>${escapeHtml(plugin.shortDescription || plugin.category || plugin.marketplaceName || "")}</small>
+          </span>
+          <em>${escapeHtml(plugin.installed ? "已安装" : plugin.installPolicy || "可用")}</em>
+          <button class="ghost-action" type="button"
+            ${plugin.installed ? `data-plugin-uninstall="${escapeAttribute(plugin.id || plugin.name || "")}"` : `data-plugin-install="${escapeAttribute(plugin.name || plugin.id || "")}"`}
+            data-plugin-marketplace="${escapeAttribute(plugin.marketplaceName || "")}"
+            data-plugin-marketplace-path="${escapeAttribute(plugin.marketplacePath || "")}">
+            ${plugin.installed ? "卸载" : "安装"}
+          </button>
+        </div>
+      `).join("")}
+    </div>
+    ${ecosystem.plugins.marketplaceLoadErrors.length ? `<div class="ecosystem-errors">${escapeHtml(`${ecosystem.plugins.marketplaceLoadErrors.length} 个 Marketplace 读取错误`)}</div>` : ""}
+  `;
+}
+
+function renderMcpRows(ecosystem) {
+  const servers = ecosystem.mcp.slice(0, 80);
+  if (!servers.length) return `<p class="muted ecosystem-empty">还没有读取到 MCP server。</p>`;
+  return `
+    <div class="ecosystem-list">
+      ${servers.map((server) => `
+        <div class="ecosystem-row">
+          <span class="setting-icon">${icon("grid")}</span>
+          <span>
+            <strong>${escapeHtml(server.name || "MCP")}</strong>
+            <small>${escapeHtml(`${server.authStatus || "unknown"} · ${server.toolCount || 0} tools`)}</small>
+          </span>
+          <em>${server.isEnabled ? "启用" : "停用"}</em>
+          <button class="ghost-action" type="button" data-mcp-toggle="${escapeAttribute(server.name || "")}" data-mcp-enabled="${server.isEnabled ? "false" : "true"}">${server.isEnabled ? "停用" : "启用"}</button>
+          <button class="ghost-action" type="button" data-mcp-oauth="${escapeAttribute(server.name || "")}">OAuth</button>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderAppRows(ecosystem) {
+  const apps = ecosystem.apps.slice(0, 80);
+  if (!apps.length) return `<p class="muted ecosystem-empty">还没有读取到 Apps。</p>`;
+  return `
+    <div class="ecosystem-list">
+      ${apps.map((appInfo) => `
+        <div class="ecosystem-row">
+          <span class="setting-icon">${icon("panel")}</span>
+          <span>
+            <strong>${escapeHtml(appInfo.name || appInfo.id || "App")}</strong>
+            <small>${escapeHtml(appInfo.description || (Array.isArray(appInfo.pluginDisplayNames) ? appInfo.pluginDisplayNames.join(", ") : ""))}</small>
+          </span>
+          <em>${appInfo.isEnabled ? "启用" : appInfo.isAccessible ? "可用" : "不可用"}</em>
+          <button class="ghost-action" type="button" data-app-toggle="${escapeAttribute(appInfo.id || "")}" data-app-enabled="${appInfo.isEnabled ? "false" : "true"}">${appInfo.isEnabled ? "停用" : "启用"}</button>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderConfigPanel(ecosystem) {
+  return `
+    <form class="ecosystem-config-form" id="ecosystem-config-form">
+      <label>
+        <span>配置路径</span>
+        <input name="keyPath" value="${escapeAttribute(ecosystem.configKey)}" placeholder="model_provider 或 mcp_servers.github.enabled">
+      </label>
+      <label>
+        <span>JSON 值</span>
+        <textarea name="value" rows="4" placeholder='"third-party" 或 true'>${escapeHtml(ecosystem.configValue)}</textarea>
+      </label>
+      <div class="action-line">
+        <button class="ghost-action" type="submit">写入配置</button>
+      </div>
+    </form>
+  `;
+}
+
+function ecosystemPlugins(ecosystem) {
+  return ecosystem.plugins.marketplaces.flatMap((marketplace) => (
+    Array.isArray(marketplace.plugins)
+      ? marketplace.plugins.map((plugin) => ({
+        ...plugin,
+        marketplaceName: plugin.marketplaceName || marketplace.name || "",
+        marketplacePath: plugin.marketplacePath || marketplace.path || null,
+      }))
+      : []
+  ));
+}
+
+function sampleSkillNames(ecosystem) {
+  return ecosystem.skills.skills.slice(0, 3).map((skill) => skill.displayName || skill.name).filter(Boolean).join(", ");
+}
+
+function samplePluginNames(ecosystem) {
+  return ecosystemPlugins(ecosystem).slice(0, 3).map((plugin) => plugin.displayName || plugin.name || plugin.id).filter(Boolean).join(", ");
+}
+
+function sampleMcpNames(ecosystem) {
+  return ecosystem.mcp.slice(0, 3).map((server) => server.name).filter(Boolean).join(", ");
+}
+
+function sampleAppNames(ecosystem) {
+  return ecosystem.apps.slice(0, 3).map((appInfo) => appInfo.name || appInfo.id).filter(Boolean).join(", ");
 }
 
 function remoteCommandButtons() {
@@ -1193,7 +1450,7 @@ function renderAdmin(mobile) {
       <header class="settings-head tool-page-head">
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div>
-          <h1>管理</h1>
+          <h1>个人项目</h1>
           <p>个人服务、项目目录和运行维护</p>
         </div>
         <button class="icon-btn" id="refresh-admin" title="刷新">${icon("refresh")}</button>
@@ -1331,6 +1588,8 @@ function bindApp() {
   document.querySelector("#cap-new-session")?.addEventListener("click", openNewSession);
   document.querySelector("#refresh-reports")?.addEventListener("click", () => refreshReports());
   document.querySelector("#refresh-admin")?.addEventListener("click", () => refreshAdmin());
+  document.querySelector("#refresh-ecosystem")?.addEventListener("click", () => refreshEcosystem());
+  document.querySelector("#ecosystem-config-form")?.addEventListener("submit", writeEcosystemConfig);
   for (const form of document.querySelectorAll("[data-admin-project-form]")) {
     form.addEventListener("submit", saveAdminProject);
   }
@@ -1357,12 +1616,19 @@ function bindApp() {
     button.addEventListener("click", () => setView(button.getAttribute("data-view") || "sessions"));
   }
   for (const button of document.querySelectorAll("[data-capability-target]")) {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       const target = button.getAttribute("data-capability-target") || "sessions";
       if (target === "chat") {
         state.sessionToolsOpen = false;
         state.view = state.currentSession || state.sessionId ? "chat" : "sessions";
         render();
+        return;
+      }
+      if (target === "projects") {
+        state.view = "capabilities";
+        render();
+        if (!state.admin.settings && !state.adminLoading) await refreshAdmin({ silent: true });
+        requestAnimationFrame(() => document.querySelector("#personal-projects-panel")?.scrollIntoView?.({ block: "start" }));
         return;
       }
       setView(target);
@@ -1414,6 +1680,37 @@ function bindApp() {
   }
   for (const button of document.querySelectorAll("[data-command]")) {
     button.addEventListener("click", () => insertCommand(button.getAttribute("data-command") || ""));
+  }
+  for (const button of document.querySelectorAll("[data-copy-text]")) {
+    button.addEventListener("click", async () => {
+      await copyText(button.getAttribute("data-copy-text") || "");
+      state.notice = "已复制";
+      render();
+    });
+  }
+  for (const button of document.querySelectorAll("[data-ecosystem-tab]")) {
+    button.addEventListener("click", () => {
+      state.ecosystem.tab = button.getAttribute("data-ecosystem-tab") || "skills";
+      render();
+    });
+  }
+  for (const button of document.querySelectorAll("[data-skill-toggle]")) {
+    button.addEventListener("click", () => toggleSkill(button.getAttribute("data-skill-toggle") || "", button.getAttribute("data-skill-enabled") === "true"));
+  }
+  for (const button of document.querySelectorAll("[data-app-toggle]")) {
+    button.addEventListener("click", () => toggleApp(button.getAttribute("data-app-toggle") || "", button.getAttribute("data-app-enabled") === "true"));
+  }
+  for (const button of document.querySelectorAll("[data-mcp-toggle]")) {
+    button.addEventListener("click", () => toggleMcp(button.getAttribute("data-mcp-toggle") || "", button.getAttribute("data-mcp-enabled") === "true"));
+  }
+  for (const button of document.querySelectorAll("[data-mcp-oauth]")) {
+    button.addEventListener("click", () => startMcpOauth(button.getAttribute("data-mcp-oauth") || ""));
+  }
+  for (const button of document.querySelectorAll("[data-plugin-install]")) {
+    button.addEventListener("click", () => installPluginFromButton(button));
+  }
+  for (const button of document.querySelectorAll("[data-plugin-uninstall]")) {
+    button.addEventListener("click", () => uninstallPlugin(button.getAttribute("data-plugin-uninstall") || ""));
   }
   for (const button of document.querySelectorAll("[data-theme]")) {
     button.addEventListener("click", () => {
@@ -1507,12 +1804,15 @@ function bindSessionListActions(root = document) {
 }
 
 async function setView(view) {
-  state.view = view === "reports" || view === "admin" || view === "settings" || view === "capabilities" ? view : "sessions";
+  state.view = view === "reports" || view === "settings" || view === "capabilities" ? view : "sessions";
   state.notice = "";
   render();
   if (state.view === "reports" && !state.reports.length) await refreshReports();
-  if (state.view === "admin" && !state.admin.settings) await refreshAdmin();
   if (state.view === "capabilities") {
+    await Promise.all([
+      !state.ecosystem.loaded && !state.ecosystem.loading ? refreshEcosystem({ silent: true }) : null,
+      !state.admin.settings && !state.adminLoading ? refreshAdmin({ silent: true }) : null,
+    ]);
     return;
   }
   if (state.view === "settings") {
@@ -1670,9 +1970,9 @@ async function openWorkspaceFile(filePath) {
   }
 }
 
-async function refreshAdmin() {
+async function refreshAdmin({ silent = false } = {}) {
   state.adminLoading = true;
-  render();
+  if (!silent) render();
   try {
     const [settings, projects] = await Promise.all([
       apiFetch("/api/admin/settings").catch(() => null),
@@ -1687,6 +1987,169 @@ async function refreshAdmin() {
   } finally {
     state.adminLoading = false;
     renderAfterBackgroundRefresh();
+  }
+}
+
+async function refreshEcosystem({ silent = false } = {}) {
+  const query = ecosystemCwdQuery();
+  state.ecosystem.loading = true;
+  state.ecosystem.error = "";
+  if (!silent) render();
+  try {
+    const [skills, plugins, apps, mcp] = await Promise.all([
+      apiFetch(`/api/skills${query}${query ? "&" : "?"}forceReload=${silent ? "false" : "true"}`),
+      apiFetch(`/api/plugins${query}`),
+      apiFetch("/api/apps"),
+      apiFetch("/api/mcp"),
+    ]);
+    state.ecosystem = {
+      ...state.ecosystem,
+      loading: false,
+      loaded: true,
+      skills: {
+        cwd: skills?.cwd || null,
+        skills: Array.isArray(skills?.skills) ? skills.skills : [],
+        errors: Array.isArray(skills?.errors) ? skills.errors : [],
+      },
+      plugins: {
+        featuredPluginIds: Array.isArray(plugins?.featuredPluginIds) ? plugins.featuredPluginIds : [],
+        marketplaceLoadErrors: Array.isArray(plugins?.marketplaceLoadErrors) ? plugins.marketplaceLoadErrors : [],
+        marketplaces: Array.isArray(plugins?.marketplaces) ? plugins.marketplaces : [],
+      },
+      apps: Array.isArray(apps?.items) ? apps.items : [],
+      mcp: Array.isArray(mcp?.items) ? mcp.items : [],
+      error: "",
+    };
+  } catch (error) {
+    state.ecosystem.loading = false;
+    state.ecosystem.error = error?.payload?.message || error?.message || "生态信息读取失败";
+  } finally {
+    if (silent) renderAfterBackgroundRefresh();
+    else render();
+  }
+}
+
+function ecosystemCwdQuery() {
+  const cwd = String(state.currentSession?.cwd || state.defaultCwd || "").trim();
+  return cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
+}
+
+async function toggleSkill(name, enabled) {
+  if (!name) return;
+  state.notice = "";
+  try {
+    await apiFetch("/api/skills", { method: "PATCH", body: { name, enabled } });
+    state.notice = enabled ? "Skill 已启用" : "Skill 已停用";
+    await refreshEcosystem({ silent: true });
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "Skill 更新失败";
+    render();
+  }
+}
+
+async function toggleApp(appId, enabled) {
+  if (!appId) return;
+  state.notice = "";
+  try {
+    await apiFetch("/api/apps", { method: "PATCH", body: { appId, enabled } });
+    state.notice = enabled ? "App 已启用" : "App 已停用";
+    await refreshEcosystem({ silent: true });
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "App 更新失败";
+    render();
+  }
+}
+
+async function toggleMcp(name, enabled) {
+  if (!name) return;
+  state.notice = "";
+  try {
+    await apiFetch("/api/mcp", { method: "PATCH", body: { name, enabled } });
+    state.notice = enabled ? "MCP 已启用" : "MCP 已停用";
+    await refreshEcosystem({ silent: true });
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "MCP 更新失败";
+    render();
+  }
+}
+
+async function startMcpOauth(name) {
+  if (!name) return;
+  state.notice = "";
+  try {
+    const payload = await apiFetch(`/api/mcp/${encodeURIComponent(name)}/oauth/start`, { method: "POST", body: {} });
+    state.ecosystem.oauthUrl = payload?.authorizationUrl || "";
+    state.notice = state.ecosystem.oauthUrl ? "OAuth 链接已生成" : "OAuth 已启动";
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "OAuth 启动失败";
+  }
+  render();
+}
+
+async function installPluginFromButton(button) {
+  const pluginName = button.getAttribute("data-plugin-install") || "";
+  if (!pluginName) return;
+  const marketplaceName = button.getAttribute("data-plugin-marketplace") || null;
+  const marketplacePath = button.getAttribute("data-plugin-marketplace-path") || null;
+  state.notice = "";
+  try {
+    const payload = await apiFetch(`/api/plugins/${encodeURIComponent(pluginName)}/install`, {
+      method: "POST",
+      body: { marketplaceName, marketplacePath },
+    });
+    const authCount = Array.isArray(payload?.appsNeedingAuth) ? payload.appsNeedingAuth.length : 0;
+    state.notice = authCount ? `插件已安装，${authCount} 个 App 需要授权` : "插件已安装";
+    await refreshEcosystem({ silent: true });
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "插件安装失败";
+    render();
+  }
+}
+
+async function uninstallPlugin(pluginId) {
+  if (!pluginId) return;
+  state.notice = "";
+  try {
+    await apiFetch(`/api/plugins/${encodeURIComponent(pluginId)}/uninstall`, { method: "POST" });
+    state.notice = "插件已卸载";
+    await refreshEcosystem({ silent: true });
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "插件卸载失败";
+    render();
+  }
+}
+
+async function writeEcosystemConfig(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const data = new FormData(form);
+  const keyPath = String(data.get("keyPath") || "").trim();
+  const rawValue = String(data.get("value") || "").trim();
+  state.ecosystem.configKey = keyPath;
+  state.ecosystem.configValue = rawValue;
+  if (!keyPath) {
+    state.notice = "配置路径不能为空";
+    render();
+    return;
+  }
+  let value = rawValue;
+  if (rawValue) {
+    try {
+      value = JSON.parse(rawValue);
+    } catch (_error) {
+      value = rawValue;
+    }
+  }
+  try {
+    await apiFetch("/api/config/value", {
+      method: "POST",
+      body: { keyPath, value, mergeStrategy: "upsert" },
+    });
+    state.notice = "配置已写入";
+    await refreshEcosystem({ silent: true });
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "配置写入失败";
+    render();
   }
 }
 

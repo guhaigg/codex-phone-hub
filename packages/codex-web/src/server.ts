@@ -551,6 +551,169 @@ async function handleRequest({
     return;
   }
 
+  if (pathname === '/api/skills' && method === 'GET') {
+    writeJson(response, 200, await runtime.listSkills({
+      cwd: normalizeOptionalString(url.searchParams.get('cwd')) || null,
+      forceReload: url.searchParams.get('forceReload') === 'true',
+    }));
+    return;
+  }
+
+  if (pathname === '/api/skills' && method === 'PATCH') {
+    if (!canManageRuntimeEcosystem(principal)) {
+      writeJson(response, 403, { error: 'forbidden' });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const name = normalizeOptionalString(body.name) || null;
+    const skillPath = normalizeOptionalString(body.path) || null;
+    if (typeof body.enabled !== 'boolean' || (!name && !skillPath)) {
+      writeJson(response, 400, { error: 'invalid_skill_update', message: 'enabled and name or path are required.' });
+      return;
+    }
+    await runtime.setSkillEnabled({ enabled: body.enabled, name, path: skillPath });
+    writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (pathname === '/api/plugins' && method === 'GET') {
+    writeJson(response, 200, await runtime.listPlugins({
+      cwd: normalizeOptionalString(url.searchParams.get('cwd')) || null,
+    }));
+    return;
+  }
+
+  const pluginInstallMatch = pathname.match(/^\/api\/plugins\/([^/]+)\/install$/u);
+  if (pluginInstallMatch && method === 'POST') {
+    if (!canManageRuntimeEcosystem(principal)) {
+      writeJson(response, 403, { error: 'forbidden' });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const result = await runtime.installPlugin({
+      pluginName: decodeURIComponent(pluginInstallMatch[1]!),
+      marketplaceName: normalizeOptionalString(body.marketplaceName) || null,
+      marketplacePath: normalizeOptionalString(body.marketplacePath) || null,
+    });
+    writeJson(response, 200, { ok: true, ...result });
+    return;
+  }
+
+  const pluginUninstallMatch = pathname.match(/^\/api\/plugins\/([^/]+)\/uninstall$/u);
+  if (pluginUninstallMatch && method === 'POST') {
+    if (!canManageRuntimeEcosystem(principal)) {
+      writeJson(response, 403, { error: 'forbidden' });
+      return;
+    }
+    await runtime.uninstallPlugin({ pluginId: decodeURIComponent(pluginUninstallMatch[1]!) });
+    writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  const pluginMatch = pathname.match(/^\/api\/plugins\/([^/]+)$/u);
+  if (pluginMatch && method === 'GET') {
+    const plugin = await runtime.readPlugin({
+      pluginName: decodeURIComponent(pluginMatch[1]!),
+      marketplaceName: normalizeOptionalString(url.searchParams.get('marketplaceName')) || null,
+      marketplacePath: normalizeOptionalString(url.searchParams.get('marketplacePath')) || null,
+    });
+    if (!plugin) {
+      writeSessionNotFound(response);
+      return;
+    }
+    writeJson(response, 200, { plugin });
+    return;
+  }
+
+  if (pathname === '/api/apps' && method === 'GET') {
+    writeJson(response, 200, { items: await runtime.listApps() });
+    return;
+  }
+
+  if (pathname === '/api/apps' && method === 'PATCH') {
+    if (!canManageRuntimeEcosystem(principal)) {
+      writeJson(response, 403, { error: 'forbidden' });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const appId = normalizeOptionalString(body.appId);
+    if (!appId || typeof body.enabled !== 'boolean') {
+      writeJson(response, 400, { error: 'invalid_app_update', message: 'appId and enabled are required.' });
+      return;
+    }
+    await runtime.setAppEnabled({ appId, enabled: body.enabled });
+    writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (pathname === '/api/mcp' && method === 'GET') {
+    writeJson(response, 200, { items: await runtime.listMcpServerStatuses() });
+    return;
+  }
+
+  if (pathname === '/api/mcp' && method === 'PATCH') {
+    if (!canManageRuntimeEcosystem(principal)) {
+      writeJson(response, 403, { error: 'forbidden' });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const name = normalizeOptionalString(body.name);
+    if (!name || typeof body.enabled !== 'boolean') {
+      writeJson(response, 400, { error: 'invalid_mcp_update', message: 'name and enabled are required.' });
+      return;
+    }
+    await runtime.setMcpServerEnabled({ name, enabled: body.enabled });
+    writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  const mcpOauthMatch = pathname.match(/^\/api\/mcp\/([^/]+)\/oauth\/start$/u);
+  if (mcpOauthMatch && method === 'POST') {
+    if (!canManageRuntimeEcosystem(principal)) {
+      writeJson(response, 403, { error: 'forbidden' });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const result = await runtime.startMcpServerOauthLogin({
+      name: decodeURIComponent(mcpOauthMatch[1]!),
+      scopes: Array.isArray(body.scopes)
+        ? body.scopes.filter((scope): scope is string => typeof scope === 'string' && scope.trim().length > 0)
+        : null,
+      timeoutSecs: Number.isFinite(body.timeoutSecs) ? Number(body.timeoutSecs) : null,
+    });
+    writeJson(response, 200, result);
+    return;
+  }
+
+  if (pathname === '/api/config/value' && method === 'POST') {
+    if (!canManageRuntimeEcosystem(principal)) {
+      writeJson(response, 403, { error: 'forbidden' });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const keyPath = normalizeOptionalString(body.keyPath);
+    if (!keyPath || !Object.prototype.hasOwnProperty.call(body, 'value')) {
+      writeJson(response, 400, { error: 'invalid_config_write', message: 'keyPath and value are required.' });
+      return;
+    }
+    const writer = typeof runtime.writeRuntimeConfigValue === 'function'
+      ? runtime.writeRuntimeConfigValue.bind(runtime)
+      : (runtime as unknown as { writeConfigValue?: (args: any) => Promise<void> }).writeConfigValue?.bind(runtime);
+    if (typeof writer !== 'function') {
+      writeJson(response, 501, { error: 'not_supported' });
+      return;
+    }
+    await writer({
+      keyPath,
+      value: body.value,
+      mergeStrategy: body.mergeStrategy === 'replace' ? 'replace' : 'upsert',
+      filePath: normalizeOptionalString(body.filePath) || null,
+      expectedVersion: normalizeOptionalString(body.expectedVersion) || null,
+    });
+    writeJson(response, 200, { ok: true });
+    return;
+  }
+
   if (pathname === '/api/sessions' && method === 'GET') {
     const options = url.searchParams.get('favorite') === 'true'
       ? { favorite: true }
@@ -2014,6 +2177,10 @@ function publicSettingsPayload(
 }
 
 function canSetSiteTitle(principal: CodexWebPrincipal): boolean {
+  return principal.mode === 'single' || principal.isAdmin === true;
+}
+
+function canManageRuntimeEcosystem(principal: CodexWebPrincipal): boolean {
   return principal.mode === 'single' || principal.isAdmin === true;
 }
 
