@@ -113,6 +113,7 @@ let lastFormControlInteractionAt = 0;
 let promptFocusLayoutTimer = null;
 let promptFocusRestoreTimer = null;
 let appVersionCheckInFlight = false;
+let pageResumeRecoveryTimer = null;
 let workspaceEventsDeferredTimer = null;
 let workspaceEventsConnectAfterLoadAttached = false;
 const workspaceRefreshQueue = {
@@ -406,7 +407,7 @@ function renderDesktopApp() {
 
 function renderMobileApp() {
   const content = state.view === "sessions"
-    ? `<section class="mobile-page">${renderSessionHeader(true)}${renderSessionList()}</section>`
+    ? `<section class="mobile-page">${renderSessionHeader(true)}<div id="mobile-session-results">${renderSessionList()}</div></section>`
     : renderWorkspace(true);
   return `
     <main class="mobile-shell">
@@ -1766,10 +1767,21 @@ function requestComposerSubmit() {
 
 function handleSessionSearchInput(event) {
   state.search = event.target.value;
-  if (!state.isMobile && renderSidebarRecentsOnly()) {
+  if (renderSessionSearchResultsOnly()) {
     return;
   }
   render();
+}
+
+function renderSessionSearchResultsOnly() {
+  if (state.isMobile) {
+    const results = document.querySelector("#mobile-session-results");
+    if (!results) return false;
+    results.innerHTML = renderSessionList();
+    bindSessionListActions(results);
+    return true;
+  }
+  return renderSidebarRecentsOnly();
 }
 
 function renderSidebarRecentsOnly() {
@@ -2452,8 +2464,13 @@ function onVisibilityChange() {
 
 function onPageResume() {
   if (!state.token && !state.authSession) return;
-  if (isFormControlInteractionActive()) return;
-  void recoverActiveTurnAfterForeground();
+  if (pageResumeRecoveryTimer) clearTimeout(pageResumeRecoveryTimer);
+  pageResumeRecoveryTimer = setTimeout(() => {
+    pageResumeRecoveryTimer = null;
+    if (!state.token && !state.authSession) return;
+    if (isFormControlInteractionActive()) return;
+    void recoverActiveTurnAfterForeground();
+  }, 160);
 }
 
 function isTurnStreamHealthy() {

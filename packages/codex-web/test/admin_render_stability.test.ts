@@ -173,3 +173,106 @@ test('personal workbench renders ecosystem controls without multi-role managemen
   assert.doesNotMatch(html, /用户/u);
   assert.ok(html.length < 180_000, `capability markup should stay bounded, got ${html.length} bytes`);
 });
+
+test('page resume waits for form focus before refreshing the session', async () => {
+  const storage = new Map<string, string>();
+  const fetchCalls: string[] = [];
+  const timers: Array<() => void> = [];
+  let activeElement: any = null;
+  class TestElement {
+    closest(selector: string) {
+      return selector.includes('textarea') ? this : null;
+    }
+  }
+  const appElement = { innerHTML: '' };
+  const context: any = {
+    console,
+    URL,
+    Date,
+    Set,
+    Map,
+    Promise,
+    TextDecoder,
+    TextEncoder,
+    AbortController,
+    Element: TestElement,
+    localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, String(value)),
+      removeItem: (key: string) => storage.delete(key),
+    },
+    location: { origin: 'http://127.0.0.1', hostname: '127.0.0.1' },
+    navigator: {},
+    document: {
+      readyState: 'complete',
+      visibilityState: 'visible',
+      get activeElement() {
+        return activeElement;
+      },
+      scrollingElement: { scrollTop: 0 },
+      documentElement: { scrollTop: 0, dataset: {} },
+      title: '',
+      addEventListener() {},
+      querySelector(selector: string) {
+        return selector === '#app' ? appElement : null;
+      },
+      querySelectorAll() {
+        return [];
+      },
+      createElement() {
+        return {
+          style: {},
+          classList: { toggle() {}, remove() {} },
+          appendChild() {},
+          remove() {},
+        };
+      },
+      body: { appendChild() {} },
+    },
+    window: {
+      innerWidth: 1440,
+      location: { hostname: '127.0.0.1', origin: 'http://127.0.0.1' },
+      addEventListener() {},
+      matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    },
+    requestAnimationFrame(callback: () => void) {
+      callback();
+    },
+    setTimeout(callback: () => void) {
+      timers.push(callback);
+      return timers.length;
+    },
+    clearTimeout() {},
+    fetch: async (path: string) => {
+      fetchCalls.push(path);
+      return { ok: true, status: 200, json: async () => ({ session: { id: 'session_1', settings: { metadata: {} } } }) };
+    },
+  };
+
+  vm.runInNewContext(`${appSource}
+globalThis.__resumeTest = {
+  state,
+  onPageResume,
+};`, context);
+
+  const api = context.__resumeTest;
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', settings: { metadata: {} } };
+
+  api.onPageResume();
+  assert.deepEqual(fetchCalls, []);
+
+  activeElement = new TestElement();
+  timers.splice(0).forEach((callback) => callback());
+  await Promise.resolve();
+
+  assert.deepEqual(fetchCalls, []);
+});
+
+test('mobile session search updates the result list without rerendering the app shell', () => {
+  assert.match(appSource, /id="mobile-session-results"/u);
+  assert.match(appSource, /function renderSessionSearchResultsOnly\(/u);
+  assert.match(appSource, /handleSessionSearchInput[\s\S]*renderSessionSearchResultsOnly\(\)/u);
+});
