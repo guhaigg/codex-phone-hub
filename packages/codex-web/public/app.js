@@ -252,7 +252,7 @@ async function restoreAuth() {
     handleApiError(error, { auth: true });
   } finally {
     state.loading = false;
-    render();
+    renderAuthenticatedAfterBackgroundRefresh();
   }
 }
 
@@ -326,6 +326,22 @@ function render(options = {}) {
   bindApp();
   restoreFocusedComposerState(composerSnapshot);
   requestAnimationFrame(scrollChatToBottom);
+}
+
+function renderWorkspaceOnly() {
+  if (state.isMobile) {
+    return false;
+  }
+  const pane = document.querySelector(".workspace-pane");
+  if (!pane) {
+    return false;
+  }
+  const composerSnapshot = captureFocusedComposerState();
+  pane.innerHTML = renderWorkspace(false);
+  bindApp(pane);
+  restoreFocusedComposerState(composerSnapshot);
+  requestAnimationFrame(scrollChatToBottom);
+  return true;
 }
 
 function renderLogin() {
@@ -1557,77 +1573,80 @@ function renderBottomNav() {
   `;
 }
 
-function bindApp() {
-  document.querySelector("#open-settings")?.addEventListener("click", () => {
+function bindApp(root = document) {
+  const qs = (selector) => root.querySelector?.(selector) || null;
+  const qsa = (selector) => Array.from(root.querySelectorAll?.(selector) || []);
+
+  qs("#open-settings")?.addEventListener("click", () => {
     setView("settings");
   });
-  document.querySelector("#back-to-sessions")?.addEventListener("click", () => {
+  qs("#back-to-sessions")?.addEventListener("click", () => {
     state.view = "sessions";
-    render();
+    renderWorkspaceOnly() || render();
   });
-  document.querySelector("#new-session-button")?.addEventListener("click", openNewSession);
-  document.querySelector("#empty-new-session-button")?.addEventListener("click", openNewSession);
-  document.querySelector("#refresh-session")?.addEventListener("click", () => refreshCurrentSession());
-  document.querySelector("#share-session")?.addEventListener("click", shareCurrentSession);
-  document.querySelector("#toggle-session-tools")?.addEventListener("click", () => {
+  qs("#new-session-button")?.addEventListener("click", openNewSession);
+  qs("#empty-new-session-button")?.addEventListener("click", openNewSession);
+  qs("#refresh-session")?.addEventListener("click", () => refreshCurrentSession());
+  qs("#share-session")?.addEventListener("click", shareCurrentSession);
+  qs("#toggle-session-tools")?.addEventListener("click", () => {
     state.sessionToolsOpen = !state.sessionToolsOpen;
     render();
   });
-  document.querySelector("#toggle-workspace")?.addEventListener("click", toggleWorkspaceInspector);
-  document.querySelector("#refresh-workspace")?.addEventListener("click", () => refreshWorkspaceInspector());
-  document.querySelector("#show-more-timeline")?.addEventListener("click", showMoreTimelineHistory);
-  document.querySelector("#session-settings-form")?.addEventListener("submit", saveSessionSettings);
-  document.querySelector("#save-session-settings")?.addEventListener("click", saveSessionSettings);
-  document.querySelector("#session-favorite")?.addEventListener("click", () => {
+  qs("#toggle-workspace")?.addEventListener("click", toggleWorkspaceInspector);
+  qs("#refresh-workspace")?.addEventListener("click", () => refreshWorkspaceInspector());
+  qs("#show-more-timeline")?.addEventListener("click", showMoreTimelineHistory);
+  qs("#session-settings-form")?.addEventListener("submit", saveSessionSettings);
+  qs("#save-session-settings")?.addEventListener("click", saveSessionSettings);
+  qs("#session-favorite")?.addEventListener("click", () => {
     const sessionId = state.currentSession?.id || state.sessionId;
     if (sessionId) toggleFavorite(sessionId);
   });
-  document.querySelector("#session-archive")?.addEventListener("click", () => {
+  qs("#session-archive")?.addEventListener("click", () => {
     const sessionId = state.currentSession?.id || state.sessionId;
     if (sessionId) toggleArchive(sessionId);
   });
-  document.querySelector("#cap-new-session")?.addEventListener("click", openNewSession);
-  document.querySelector("#refresh-reports")?.addEventListener("click", () => refreshReports());
-  document.querySelector("#refresh-admin")?.addEventListener("click", () => refreshAdmin());
-  document.querySelector("#refresh-ecosystem")?.addEventListener("click", () => refreshEcosystem());
-  document.querySelector("#ecosystem-config-form")?.addEventListener("submit", writeEcosystemConfig);
-  for (const form of document.querySelectorAll("[data-admin-project-form]")) {
+  qs("#cap-new-session")?.addEventListener("click", openNewSession);
+  qs("#refresh-reports")?.addEventListener("click", () => refreshReports());
+  qs("#refresh-admin")?.addEventListener("click", () => refreshAdmin());
+  qs("#refresh-ecosystem")?.addEventListener("click", () => refreshEcosystem());
+  qs("#ecosystem-config-form")?.addEventListener("submit", writeEcosystemConfig);
+  for (const form of qsa("[data-admin-project-form]")) {
     form.addEventListener("submit", saveAdminProject);
   }
-  document.querySelector("#refresh-usage")?.addEventListener("click", () => refreshUsage());
-  document.querySelector("#reload-runtime")?.addEventListener("click", reloadRuntime);
-  document.querySelector("#logout-button")?.addEventListener("click", logout);
-  document.querySelector("#clear-cache")?.addEventListener("click", clearLocalCache);
-  document.querySelector("#settings-form")?.addEventListener("submit", saveSettingsForm);
-  document.querySelector("#attach-button")?.addEventListener("click", () => document.querySelector("#file-input")?.click());
-  document.querySelector("#file-input")?.addEventListener("change", (event) => {
+  qs("#refresh-usage")?.addEventListener("click", () => refreshUsage());
+  qs("#reload-runtime")?.addEventListener("click", reloadRuntime);
+  qs("#logout-button")?.addEventListener("click", logout);
+  qs("#clear-cache")?.addEventListener("click", clearLocalCache);
+  qs("#settings-form")?.addEventListener("submit", saveSettingsForm);
+  qs("#attach-button")?.addEventListener("click", () => qs("#file-input")?.click());
+  qs("#file-input")?.addEventListener("change", (event) => {
     state.selectedFiles = [...state.selectedFiles, ...Array.from(event.target.files || [])].slice(0, 8);
     render();
   });
 
-  const search = document.querySelector("#session-search");
+  const search = qs("#session-search");
   search?.addEventListener("input", handleSessionSearchInput);
-  for (const button of document.querySelectorAll("[data-filter]")) {
+  for (const button of qsa("[data-filter]")) {
     button.addEventListener("click", async () => {
       state.sortMode = button.getAttribute("data-filter") || "all";
       await refreshSessions();
     });
   }
-  for (const button of document.querySelectorAll("[data-view]")) {
+  for (const button of qsa("[data-view]")) {
     button.addEventListener("click", () => setView(button.getAttribute("data-view") || "sessions"));
   }
-  for (const button of document.querySelectorAll("[data-capability-target]")) {
+  for (const button of qsa("[data-capability-target]")) {
     button.addEventListener("click", async () => {
       const target = button.getAttribute("data-capability-target") || "sessions";
       if (target === "chat") {
         state.sessionToolsOpen = false;
         state.view = state.currentSession || state.sessionId ? "chat" : "sessions";
-        render();
+        renderWorkspaceOnly() || render();
         return;
       }
       if (target === "projects") {
         state.view = "capabilities";
-        render();
+        renderWorkspaceOnly() || render();
         if (!state.admin.settings && !state.adminLoading) await refreshAdmin({ silent: true });
         requestAnimationFrame(() => document.querySelector("#personal-projects-panel")?.scrollIntoView?.({ block: "start" }));
         return;
@@ -1635,91 +1654,102 @@ function bindApp() {
       setView(target);
     });
   }
-  bindSessionListActions();
-  for (const button of document.querySelectorAll("[data-report-open]")) {
+  bindSessionListActions(root);
+  for (const button of qsa("[data-report-open]")) {
     button.addEventListener("click", () => selectReport(button.getAttribute("data-report-open") || ""));
   }
-  for (const link of document.querySelectorAll("[data-report-path]")) {
+  for (const link of qsa("[data-report-path]")) {
     link.addEventListener("click", (event) => {
       event.preventDefault();
       openReportByPath(link.getAttribute("data-report-path") || "");
     });
   }
-  for (const button of document.querySelectorAll("[data-report-favorite]")) {
+  for (const button of qsa("[data-report-favorite]")) {
     button.addEventListener("click", () => toggleReportFavorite(button.getAttribute("data-report-favorite") || ""));
   }
-  for (const button of document.querySelectorAll("[data-workspace-file]")) {
+  for (const button of qsa("[data-workspace-file]")) {
     button.addEventListener("click", () => openWorkspaceFile(button.getAttribute("data-workspace-file") || ""));
   }
-  for (const button of document.querySelectorAll("[data-remove-file]")) {
+  for (const button of qsa("[data-remove-file]")) {
     button.addEventListener("click", () => {
       const index = Number(button.getAttribute("data-remove-file"));
       state.selectedFiles.splice(index, 1);
       render();
     });
   }
-  for (const button of document.querySelectorAll("[data-approval]")) {
+  for (const button of qsa("[data-approval]")) {
     button.addEventListener("click", () => resolveApproval(
       button.getAttribute("data-approval") || "",
       button.getAttribute("data-approval-action") || "deny",
     ));
   }
-  for (const button of document.querySelectorAll("[data-mobile-tab]")) {
+  for (const button of qsa("[data-mobile-tab]")) {
     button.addEventListener("click", () => {
       const tab = button.getAttribute("data-mobile-tab");
       if (tab === "new") return openNewSession();
       setView(tab || "sessions");
     });
   }
-  for (const button of document.querySelectorAll("[data-quick]")) {
-    button.addEventListener("click", () => {
+  for (const button of qsa("[data-quick]")) {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       const text = button.getAttribute("data-quick") || "";
-      state.prompt = state.prompt ? `${state.prompt}\n${text}` : text;
-      render();
-      document.querySelector("#prompt-input")?.focus();
+      const nextPrompt = state.prompt ? `${state.prompt}\n${text}` : text;
+      const input = button.closest("#composer-form")?.querySelector("#prompt-input") || document.querySelector("#prompt-input");
+      if (!setPromptDraft(nextPrompt, { focus: true, input })) {
+        render();
+        focusPromptEnd();
+      }
     });
   }
-  for (const button of document.querySelectorAll("[data-command]")) {
-    button.addEventListener("click", () => insertCommand(button.getAttribute("data-command") || ""));
+  for (const button of qsa("[data-command]")) {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      insertCommand(button.getAttribute("data-command") || "", {
+        input: button.closest("#composer-form")?.querySelector("#prompt-input") || null,
+      });
+    });
   }
-  for (const button of document.querySelectorAll("[data-copy-text]")) {
+  for (const button of qsa("[data-copy-text]")) {
     button.addEventListener("click", async () => {
       await copyText(button.getAttribute("data-copy-text") || "");
       state.notice = "已复制";
       render();
     });
   }
-  for (const button of document.querySelectorAll("[data-ecosystem-tab]")) {
+  for (const button of qsa("[data-ecosystem-tab]")) {
     button.addEventListener("click", () => {
       state.ecosystem.tab = button.getAttribute("data-ecosystem-tab") || "skills";
       render();
     });
   }
-  for (const button of document.querySelectorAll("[data-skill-toggle]")) {
+  for (const button of qsa("[data-skill-toggle]")) {
     button.addEventListener("click", () => toggleSkill(button.getAttribute("data-skill-toggle") || "", button.getAttribute("data-skill-enabled") === "true"));
   }
-  for (const button of document.querySelectorAll("[data-app-toggle]")) {
+  for (const button of qsa("[data-app-toggle]")) {
     button.addEventListener("click", () => toggleApp(button.getAttribute("data-app-toggle") || "", button.getAttribute("data-app-enabled") === "true"));
   }
-  for (const button of document.querySelectorAll("[data-mcp-toggle]")) {
+  for (const button of qsa("[data-mcp-toggle]")) {
     button.addEventListener("click", () => toggleMcp(button.getAttribute("data-mcp-toggle") || "", button.getAttribute("data-mcp-enabled") === "true"));
   }
-  for (const button of document.querySelectorAll("[data-mcp-oauth]")) {
+  for (const button of qsa("[data-mcp-oauth]")) {
     button.addEventListener("click", () => startMcpOauth(button.getAttribute("data-mcp-oauth") || ""));
   }
-  for (const button of document.querySelectorAll("[data-plugin-install]")) {
+  for (const button of qsa("[data-plugin-install]")) {
     button.addEventListener("click", () => installPluginFromButton(button));
   }
-  for (const button of document.querySelectorAll("[data-plugin-uninstall]")) {
+  for (const button of qsa("[data-plugin-uninstall]")) {
     button.addEventListener("click", () => uninstallPlugin(button.getAttribute("data-plugin-uninstall") || ""));
   }
-  for (const button of document.querySelectorAll("[data-theme]")) {
+  for (const button of qsa("button[data-theme]")) {
     button.addEventListener("click", () => {
       applyTheme(button.getAttribute("data-theme") || "light", { persist: true });
       render();
     });
   }
-  const promptInput = document.querySelector("#prompt-input");
+  const promptInput = qs("#prompt-input");
   if (promptInput) {
     promptInput.addEventListener('touchstart', syncPromptFocusLayout, { passive: true });
     promptInput.addEventListener('focus', syncPromptFocusLayout);
@@ -1730,18 +1760,18 @@ function bindApp() {
     });
     promptInput.addEventListener("keydown", handlePromptKeydown);
   }
-  document.querySelector("#composer-form")?.addEventListener("submit", sendPrompt);
-  document.querySelector("#send-button")?.addEventListener("click", handleComposerSendClick);
-  document.querySelector("#queue-message-button")?.addEventListener("click", queueCurrentPrompt);
-  for (const button of document.querySelectorAll("[data-remove-queued-message]")) {
+  qs("#composer-form")?.addEventListener("submit", sendPrompt);
+  qs("#send-button")?.addEventListener("click", handleComposerSendClick);
+  qs("#queue-message-button")?.addEventListener("click", queueCurrentPrompt);
+  for (const button of qsa("[data-remove-queued-message]")) {
     button.addEventListener("click", () => {
       const sessionId = currentQueueSessionId();
       removeQueuedMessage(sessionId, button.getAttribute("data-remove-queued-message") || "");
       render();
     });
   }
-  document.querySelector("#stop-button")?.addEventListener("click", stopTurn);
-  document.querySelector("#retry-last")?.addEventListener("click", retryLastUserMessage);
+  qs("#stop-button")?.addEventListener("click", stopTurn);
+  qs("#retry-last")?.addEventListener("click", retryLastUserMessage);
 }
 
 function handlePromptKeydown(event) {
@@ -1818,7 +1848,7 @@ function bindSessionListActions(root = document) {
 async function setView(view) {
   state.view = view === "reports" || view === "settings" || view === "capabilities" ? view : "sessions";
   state.notice = "";
-  render();
+  renderWorkspaceOnly() || render();
   if (state.view === "reports" && !state.reports.length) await refreshReports();
   if (state.view === "capabilities") {
     await Promise.all([
@@ -1998,7 +2028,7 @@ async function refreshAdmin({ silent = false } = {}) {
     };
   } finally {
     state.adminLoading = false;
-    renderAfterBackgroundRefresh();
+    renderWorkspaceAfterBackgroundRefresh();
   }
 }
 
@@ -2036,7 +2066,7 @@ async function refreshEcosystem({ silent = false } = {}) {
     state.ecosystem.loading = false;
     state.ecosystem.error = error?.payload?.message || error?.message || "生态信息读取失败";
   } finally {
-    if (silent) renderAfterBackgroundRefresh();
+    if (silent) renderWorkspaceAfterBackgroundRefresh();
     else render();
   }
 }
@@ -2182,7 +2212,7 @@ async function refreshSessions({ silent = false } = {}) {
   } finally {
     state.sessionsLoading = false;
     if (!silent) render();
-    else renderAfterBackgroundRefresh();
+    else renderSessionListsAfterBackgroundRefresh();
   }
 }
 
@@ -3019,16 +3049,16 @@ function readSessionSettingsControls() {
   };
 }
 
-function insertCommand(command) {
+function insertCommand(command, { input = null } = {}) {
   if (!command) return;
-  state.prompt = command.endsWith(" ") ? command : command;
+  const nextPrompt = command.endsWith(" ") ? command : command;
+  state.prompt = nextPrompt;
   state.view = "chat";
-  render();
-  const input = document.querySelector("#prompt-input");
-  if (input) {
-    input.focus();
-    input.selectionStart = input.selectionEnd = input.value.length;
+  if (setPromptDraft(nextPrompt, { focus: true, input })) {
+    return;
   }
+  render({ preserveComposer: false });
+  focusPromptEnd();
 }
 
 function stopStream(clear = true) {
@@ -3574,6 +3604,38 @@ function renderAfterBackgroundRefresh() {
   render();
 }
 
+function renderWorkspaceAfterBackgroundRefresh() {
+  if (isFormControlInteractionActive()) return;
+  renderWorkspaceOnly() || render();
+}
+
+function renderSessionListsAfterBackgroundRefresh() {
+  if (renderSessionSearchResultsOnly()) return;
+  if (isFormControlInteractionActive()) return;
+  render();
+}
+
+function renderAuthenticatedAfterBackgroundRefresh() {
+  if (!state.token) {
+    render();
+    return;
+  }
+  if (isFormControlInteractionActive()) {
+    return;
+  }
+  const shellExists = document.querySelector(".desktop-shell, .mobile-shell");
+  if (!shellExists) {
+    render();
+    return;
+  }
+  if (!state.isMobile) {
+    renderSidebarRecentsOnly();
+    renderWorkspaceOnly();
+    return;
+  }
+  renderSessionSearchResultsOnly() || render();
+}
+
 function captureFocusedComposerState() {
   const input = document.querySelector("#prompt-input");
   if (!input || document.activeElement !== input) return null;
@@ -3707,6 +3769,29 @@ function updateSendButton() {
   if (button) button.disabled = !state.prompt.trim();
   const queueButton = document.querySelector("#queue-message-button");
   if (queueButton) queueButton.disabled = !state.prompt.trim();
+}
+
+function setPromptDraft(value, { focus = false, input = null } = {}) {
+  input = input || document.querySelector("#prompt-input");
+  state.prompt = String(value || "");
+  if (!input) {
+    return false;
+  }
+  input.value = state.prompt;
+  syncPromptInputLayout(input);
+  updateSendButton();
+  if (focus) {
+    focusPromptEnd(input);
+  }
+  return true;
+}
+
+function focusPromptEnd(input = document.querySelector("#prompt-input")) {
+  if (!input) return;
+  input.focus();
+  const end = String(input.value || "").length;
+  input.selectionStart = end;
+  input.selectionEnd = end;
 }
 
 function normalizeSiteTitle(value) {
