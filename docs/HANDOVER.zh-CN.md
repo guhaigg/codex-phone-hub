@@ -92,6 +92,7 @@ Codex Phone Hub / Reverse Proxy
 /opt/workday/               默认/示例项目工作目录
 ~/.codex/                   Codex CLI 登录态与配置
 ~/.codex-web/               Codex Phone Hub 状态目录
+~/.codex-web/audit-log.jsonl 审计 JSONL，append-only
 ~/.codex-web/reports/       手机端报告目录
 ~/.codex-web/uploads/       上传文件 fallback 目录
 ~/.codex-web/logs/          应用日志
@@ -322,7 +323,22 @@ POST /api/sessions/:id/turns
 - 管理员 session audit
 - observer/read-only 查看
 
-### 6.4 移动端稳定性修复
+### 6.4 设备和审计
+
+设置页个人模式显示：
+
+- `我的设备`：来自 `GET /api/auth/sessions`，可撤销其他浏览器登录。
+- `操作记录`：来自 `GET /api/admin/audit?limit=8`，显示最近登录、退出、设备撤销、会话、turn、approval、终端、生态配置、分享读取等操作。
+
+审计文件：
+
+```text
+~/.codex-web/audit-log.jsonl
+```
+
+审计只保存操作元数据，不保存 Web 密码、Bearer token、prompt 正文、配置值、上传文件内容、终端输入正文或终端输出。
+
+### 6.5 移动端稳定性修复
 
 已修复设置页/管理页下拉框闪屏、卡住、打不开问题：
 

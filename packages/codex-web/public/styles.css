@@ -1576,6 +1576,53 @@ textarea:focus {
   color: var(--muted);
 }
 
+.security-head {
+  min-height: 48px;
+  padding: 8px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.security-audit-head {
+  margin-top: 10px;
+}
+
+.security-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.security-head strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.security-head small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.security-list {
+  display: grid;
+}
+
+.security-row {
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+}
+
+.compact-action {
+  min-height: 32px;
+  padding-inline: 11px;
+  font-size: 12px;
+}
+
 .settings-actions {
   align-items: center;
 }

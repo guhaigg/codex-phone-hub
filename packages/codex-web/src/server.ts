@@ -59,6 +59,7 @@ import {
   inspectWorkspaceStatus,
 } from './workspace_inspector.js';
 import { collectDiagnosticsSummary } from './diagnostics.js';
+import { FileAuditStore, type CodexWebAuditRecordInput } from './audit_store.js';
 
 export interface CodexWebAuthLike {
   isConfigured(): Promise<boolean>;
@@ -69,6 +70,8 @@ export interface CodexWebAuthLike {
   }): Promise<{ token: string; session: PublicAuthSession; configuredNow: boolean }>;
   verifyToken(token: string | null | undefined): Promise<PublicAuthSession | null>;
   logout(token: string | null | undefined): Promise<void>;
+  listSessions?(principal?: CodexWebPrincipal | null): Promise<PublicAuthSession[]>;
+  revokeSession?(sessionId: string, principal?: CodexWebPrincipal | null): Promise<boolean>;
   setMultiUserEnabled?(enabled: boolean): Promise<CodexWebIdentityState>;
 }
 
@@ -80,6 +83,7 @@ export interface CreateCodexWebServerOptions {
   staticFiles?: StaticFilesRecord;
   workspaceEvents?: CodexWebWorkspaceEventBus;
   terminalManager?: CodexWebTerminalManager;
+  auditStore?: CodexWebAuditStoreLike;
 }
 
 export interface CodexWebServerHandle {
@@ -91,6 +95,17 @@ export interface CodexWebServerHandle {
 interface AuthenticatedRequestContext {
   token: string;
   session: PublicAuthSession;
+}
+
+interface CodexWebAuditStoreLike {
+  record(input: CodexWebAuditRecordInput): Promise<unknown>;
+  list(input?: {
+    cursor?: string | number | null;
+    limit?: string | number | null;
+    actor?: string | null;
+    project?: string | null;
+    action?: string | null;
+  }): Promise<unknown>;
 }
 
 interface CodexWebIdentityStoreLike {
@@ -175,8 +190,12 @@ export function createCodexWebServer({
   staticFiles,
   workspaceEvents = new CodexWebWorkspaceEventBus(),
   terminalManager = new CodexWebTerminalManager(),
+  auditStore,
 }: CreateCodexWebServerOptions): CodexWebServerHandle {
   const resolvedStaticFiles = staticFiles ?? loadDefaultStaticFiles();
+  const resolvedAuditStore = auditStore ?? new FileAuditStore({
+    auditPath: path.join(config.stateDir, 'audit-log.jsonl'),
+  });
   const activeSseClosers = new Set<() => void>();
   const sockets = new Set<Socket>();
   const loginRateLimiter = new FixedWindowRateLimiter({
@@ -195,6 +214,7 @@ export function createCodexWebServer({
       config,
       workspaceEvents,
       terminalManager,
+      auditStore: resolvedAuditStore,
       loginRateLimiter,
       registerSseCloser: (close) => {
         activeSseClosers.add(close);
@@ -349,6 +369,7 @@ async function handleRequest({
   config,
   workspaceEvents,
   terminalManager,
+  auditStore,
   loginRateLimiter,
   registerSseCloser,
 }: {
@@ -361,6 +382,7 @@ async function handleRequest({
   config: CodexWebConfig;
   workspaceEvents: CodexWebWorkspaceEventBus;
   terminalManager: CodexWebTerminalManager;
+  auditStore: CodexWebAuditStoreLike;
   loginRateLimiter: FixedWindowRateLimiter;
   registerSseCloser: (close: () => void) => () => void;
 }): Promise<void> {
@@ -398,6 +420,10 @@ async function handleRequest({
     }
     const rateLimit = loginRateLimiter.take(getClientAddress(request));
     if (!rateLimit.allowed) {
+      await recordAuditSafe(auditStore, {
+        action: 'auth.login.rate_limited',
+        metadata: { client: getClientAddress(request), deviceName: request.headers['user-agent'] ?? null },
+      });
       writeJson(response, 429, {
         error: 'rate_limited',
         message: 'Too many login attempts. Try again later.',
@@ -416,8 +442,27 @@ async function handleRequest({
       response,
     });
     if (!login) {
+      await recordAuditSafe(auditStore, {
+        action: 'auth.login.failure',
+        actorUsername: typeof body.username === 'string' ? body.username : null,
+        metadata: {
+          deviceName: typeof body.deviceName === 'string' ? body.deviceName : null,
+          username: typeof body.username === 'string' ? body.username : null,
+          client: getClientAddress(request),
+        },
+      });
       return;
     }
+    await recordAuditSafe(auditStore, {
+      action: 'auth.login.success',
+      actorUserId: login.session.principal?.userId ?? null,
+      actorUsername: login.session.principal?.username ?? null,
+      sessionId: login.session.id,
+      metadata: {
+        deviceName: login.session.deviceName,
+        client: getClientAddress(request),
+      },
+    });
     writeJson(response, 200, login);
     return;
   }
@@ -436,6 +481,7 @@ async function handleRequest({
     registerSseCloser,
     request,
     url,
+    auditStore,
   });
   if (shareHandled) {
     return;
@@ -469,6 +515,7 @@ async function handleRequest({
       config,
       workspaceEvents,
       terminalManager,
+      auditStore,
       registerSseCloser,
     });
     if (handled) {
@@ -481,7 +528,60 @@ async function handleRequest({
     return;
   }
 
+  if (pathname === '/api/auth/sessions' && method === 'GET') {
+    await writeAuthSessionsResponse({
+      response,
+      auth,
+      principal,
+      currentSession: authContext.session,
+      currentSessionId: authContext.session.id,
+    });
+    return;
+  }
+
+  const authSessionRevokeMatch = pathname.match(/^\/api\/auth\/sessions\/([^/]+)$/u);
+  if (authSessionRevokeMatch && method === 'DELETE') {
+    if (typeof auth.revokeSession !== 'function') {
+      writeJson(response, 501, { error: 'not_supported' });
+      return;
+    }
+    const targetSessionId = decodeURIComponent(authSessionRevokeMatch[1]!);
+    const revoked = await auth.revokeSession(targetSessionId, principal);
+    if (!revoked) {
+      writeSessionNotFound(response);
+      return;
+    }
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'auth.session.revoked',
+      sessionId: authContext.session.id,
+      targetSessionId,
+      metadata: { current: targetSessionId === authContext.session.id },
+    }));
+    writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (pathname === '/api/admin/audit' && method === 'GET') {
+    if (!principal.isAdmin) {
+      writeJson(response, 403, { error: 'forbidden' });
+      return;
+    }
+    writeJson(response, 200, await auditStore.list({
+      cursor: url.searchParams.get('cursor'),
+      limit: url.searchParams.get('limit'),
+      actor: url.searchParams.get('actor'),
+      project: url.searchParams.get('project'),
+      action: url.searchParams.get('action'),
+    }));
+    return;
+  }
+
   if (pathname === '/api/auth/logout' && method === 'POST') {
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'auth.logout',
+      sessionId: authContext.session.id,
+      metadata: { deviceName: authContext.session.deviceName },
+    }));
     await auth.logout(authContext.token);
     writeJson(response, 200, { ok: true });
     return;
@@ -514,6 +614,11 @@ async function handleRequest({
     }
     const body = await readJsonBody(request);
     const updatedState = await identityStore.setSiteTitle(String(body.siteTitle ?? ''));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'settings.updated',
+      sessionId: authContext.session.id,
+      metadata: { keys: ['siteTitle'] },
+    }));
     writeJson(response, 200, publicSettingsPayload(updatedState, principal));
     return;
   }
@@ -611,6 +716,15 @@ async function handleRequest({
       return;
     }
     await runtime.setSkillEnabled({ enabled: body.enabled, name, path: skillPath });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'skill.updated',
+      sessionId: authContext.session.id,
+      metadata: {
+        name,
+        pathProvided: Boolean(skillPath),
+        enabled: body.enabled,
+      },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -629,11 +743,21 @@ async function handleRequest({
       return;
     }
     const body = await readJsonBody(request);
+    const pluginName = decodeURIComponent(pluginInstallMatch[1]!);
     const result = await runtime.installPlugin({
-      pluginName: decodeURIComponent(pluginInstallMatch[1]!),
+      pluginName,
       marketplaceName: normalizeOptionalString(body.marketplaceName) || null,
       marketplacePath: normalizeOptionalString(body.marketplacePath) || null,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'plugin.updated',
+      sessionId: authContext.session.id,
+      metadata: {
+        operation: 'install',
+        pluginName,
+        marketplaceName: normalizeOptionalString(body.marketplaceName) || null,
+      },
+    }));
     writeJson(response, 200, { ok: true, ...result });
     return;
   }
@@ -644,7 +768,16 @@ async function handleRequest({
       writeJson(response, 403, { error: 'forbidden' });
       return;
     }
-    await runtime.uninstallPlugin({ pluginId: decodeURIComponent(pluginUninstallMatch[1]!) });
+    const pluginId = decodeURIComponent(pluginUninstallMatch[1]!);
+    await runtime.uninstallPlugin({ pluginId });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'plugin.updated',
+      sessionId: authContext.session.id,
+      metadata: {
+        operation: 'uninstall',
+        pluginId,
+      },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -681,6 +814,11 @@ async function handleRequest({
       return;
     }
     await runtime.setAppEnabled({ appId, enabled: body.enabled });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'app.updated',
+      sessionId: authContext.session.id,
+      metadata: { appId, enabled: body.enabled },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -702,6 +840,11 @@ async function handleRequest({
       return;
     }
     await runtime.setMcpServerEnabled({ name, enabled: body.enabled });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'mcp.updated',
+      sessionId: authContext.session.id,
+      metadata: { name, enabled: body.enabled },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -720,6 +863,14 @@ async function handleRequest({
         : null,
       timeoutSecs: Number.isFinite(body.timeoutSecs) ? Number(body.timeoutSecs) : null,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'mcp.oauth.started',
+      sessionId: authContext.session.id,
+      metadata: {
+        name: decodeURIComponent(mcpOauthMatch[1]!),
+        scopeCount: Array.isArray(body.scopes) ? body.scopes.length : 0,
+      },
+    }));
     writeJson(response, 200, result);
     return;
   }
@@ -749,6 +900,16 @@ async function handleRequest({
       filePath: normalizeOptionalString(body.filePath) || null,
       expectedVersion: normalizeOptionalString(body.expectedVersion) || null,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'config.updated',
+      sessionId: authContext.session.id,
+      metadata: {
+        keyPath,
+        mergeStrategy: body.mergeStrategy === 'replace' ? 'replace' : 'upsert',
+        filePathProvided: Boolean(normalizeOptionalString(body.filePath)),
+        hasExpectedVersion: Boolean(normalizeOptionalString(body.expectedVersion)),
+      },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -767,6 +928,15 @@ async function handleRequest({
     const body = await readJsonBody(request);
     const session = await runtime.createSession(body as CreateSessionInput);
     appendWorkspaceSessionEvent(workspaceEvents, 'session.created', singleUserWorkspaceContext(session.id));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.created',
+      sessionId: authContext.session.id,
+      codexSessionId: session.id,
+      metadata: {
+        cwdProvided: Boolean(normalizeOptionalString(body.cwd)),
+        modelProvided: Boolean(normalizeOptionalString(body.model)),
+      },
+    }));
     writeJson(response, 201, { session });
     return;
   }
@@ -803,6 +973,12 @@ async function handleRequest({
       rootCwd,
       command,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'terminal.started',
+      sessionId: authContext.session.id,
+      codexSessionId: sessionId,
+      metadata: terminalAuditMetadata(terminal, command),
+    }));
     writeJson(response, 201, { terminal });
     return;
   }
@@ -839,7 +1015,18 @@ async function handleRequest({
       });
       return;
     }
-    terminalManager.writeInput(decodeURIComponent(terminalInputMatch[1]!), body.text);
+    const terminalId = decodeURIComponent(terminalInputMatch[1]!);
+    const terminal = terminalManager.get(terminalId);
+    terminalManager.writeInput(terminalId, body.text);
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'terminal.input',
+      sessionId: authContext.session.id,
+      codexSessionId: terminal?.threadId || terminal?.sessionId || null,
+      metadata: {
+        terminalId,
+        bytes: Buffer.byteLength(body.text),
+      },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -856,7 +1043,18 @@ async function handleRequest({
 
   const terminalStopMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/stop$/u);
   if (terminalStopMatch && method === 'POST') {
-    const terminal = await terminalManager.stop(decodeURIComponent(terminalStopMatch[1]!));
+    const terminalId = decodeURIComponent(terminalStopMatch[1]!);
+    const terminal = await terminalManager.stop(terminalId);
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'terminal.stopped',
+      sessionId: authContext.session.id,
+      codexSessionId: terminal.threadId || terminal.sessionId,
+      metadata: {
+        terminalId,
+        status: terminal.status,
+        exitCode: terminal.exitCode,
+      },
+    }));
     writeJson(response, 200, { terminal });
     return;
   }
@@ -912,10 +1110,22 @@ async function handleRequest({
     const input = artifactInputFromRuntimeSession(sessionId, session);
     if (action === 'content' && method === 'GET') {
       await writeArtifactJsonResponse(response, () => artifactStore.readContent(artifactId, input));
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'artifact.read',
+        sessionId: authContext.session.id,
+        codexSessionId: sessionId,
+        metadata: { artifactId, operation: 'content' },
+      }));
       return;
     }
     if (action === 'download' && method === 'GET') {
       await writeArtifactDownloadResponse(response, () => artifactStore.readBinary(artifactId, input));
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'artifact.read',
+        sessionId: authContext.session.id,
+        codexSessionId: sessionId,
+        metadata: { artifactId, operation: 'download' },
+      }));
       return;
     }
     if (action === 'favorite' && method === 'PATCH') {
@@ -930,6 +1140,12 @@ async function handleRequest({
         await artifactStore.setFavorite(artifactId, favorite);
         return { artifact: await artifactStore.readArtifact(artifactId, input) };
       });
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'artifact.favorite.updated',
+        sessionId: authContext.session.id,
+        codexSessionId: sessionId,
+        metadata: { artifactId, favorite },
+      }));
       return;
     }
   }
@@ -971,6 +1187,16 @@ async function handleRequest({
       return;
     }
     appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', singleUserWorkspaceContext(sessionId));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.timeline.appended',
+      sessionId: authContext.session.id,
+      codexSessionId: sessionId,
+      metadata: {
+        role: entryInput.role,
+        severity: entryInput.severity,
+        textLength: entryInput.text.length,
+      },
+    }));
     writeJson(response, 201, { entry });
     return;
   }
@@ -982,6 +1208,12 @@ async function handleRequest({
       return;
     }
     appendWorkspaceSessionEvent(workspaceEvents, 'session.archived', singleUserWorkspaceContext(decodeURIComponent(sessionMatch[1]!)));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.archived',
+      sessionId: authContext.session.id,
+      codexSessionId: decodeURIComponent(sessionMatch[1]!),
+      metadata: { method: 'DELETE' },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -995,6 +1227,12 @@ async function handleRequest({
       return;
     }
     appendWorkspaceSessionEvent(workspaceEvents, 'session.archived', singleUserWorkspaceContext(sessionId));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.archived',
+      sessionId: authContext.session.id,
+      codexSessionId: sessionId,
+      metadata: { method: 'POST' },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -1014,6 +1252,12 @@ async function handleRequest({
       return;
     }
     appendWorkspaceSessionEvent(workspaceEvents, 'session.favorite.updated', singleUserWorkspaceContext(sessionId));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.favorite.updated',
+      sessionId: authContext.session.id,
+      codexSessionId: sessionId,
+      metadata: { favorite: body.favorite, favoriteOrder },
+    }));
     writeJson(response, 200, { session });
     return;
   }
@@ -1028,6 +1272,12 @@ async function handleRequest({
       return;
     }
     appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', singleUserWorkspaceContext(sessionId));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.settings.updated',
+      sessionId: authContext.session.id,
+      codexSessionId: sessionId,
+      metadata: { keys: Object.keys(body).sort() },
+    }));
     writeJson(response, 200, { session });
     return;
   }
@@ -1047,6 +1297,12 @@ async function handleRequest({
       projectCwd: normalizeOptionalString(session.cwd),
       projectKey: `cwd-${stableIdHash(normalizeOptionalString(session.cwd) || sessionId, 16)}`,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.attachments.created',
+      sessionId: authContext.session.id,
+      codexSessionId: sessionId,
+      metadata: { count: items.length },
+    }));
     writeJson(response, 201, { items });
     return;
   }
@@ -1058,6 +1314,11 @@ async function handleRequest({
     if (!content) {
       return;
     }
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'artifact.read',
+      sessionId: authContext.session.id,
+      metadata: { reportId, operation: 'report-content' },
+    }));
     writeJson(response, 200, content);
     return;
   }
@@ -1083,6 +1344,11 @@ async function handleRequest({
       reportId: report.id,
       details: { favorite },
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'report.favorite.updated',
+      sessionId: authContext.session.id,
+      metadata: { reportId, favorite },
+    }));
     writeJson(response, 200, { report });
     return;
   }
@@ -1136,13 +1402,25 @@ async function handleRequest({
       context: singleUserWorkspaceContext(sessionId),
       turn,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'turn.started',
+      sessionId: authContext.session.id,
+      codexSessionId: sessionId,
+      metadata: startTurnAuditMetadata(input),
+    }));
     writeJson(response, 202, turn);
     return;
   }
 
   const interruptMatch = pathname.match(/^\/api\/turns\/([^/]+)\/interrupt$/u);
   if (interruptMatch && method === 'POST') {
-    await runtime.interruptTurn(decodeURIComponent(interruptMatch[1]!));
+    const turnId = decodeURIComponent(interruptMatch[1]!);
+    await runtime.interruptTurn(turnId);
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'turn.interrupted',
+      sessionId: authContext.session.id,
+      metadata: { turnId },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -1163,6 +1441,14 @@ async function handleRequest({
     if (!steered) {
       return;
     }
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'turn.steered',
+      sessionId: authContext.session.id,
+      metadata: {
+        turnId: decodeURIComponent(steerMatch[1]!),
+        textLength: body.text.trim().length,
+      },
+    }));
     writeJson(response, 202, steered);
     return;
   }
@@ -1190,6 +1476,11 @@ async function handleRequest({
         ? 'accept_for_session'
         : 'deny';
     await runtime.resolveApproval(approvalId, decision);
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: auditApprovalAction(decision),
+      sessionId: authContext.session.id,
+      metadata: { approvalId, decision },
+    }));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -1326,6 +1617,99 @@ async function authenticateRequest({
   return { token, session };
 }
 
+async function writeAuthSessionsResponse({
+  response,
+  auth,
+  principal,
+  currentSession,
+  currentSessionId,
+}: {
+  response: ServerResponse;
+  auth: CodexWebAuthLike;
+  principal: CodexWebPrincipal;
+  currentSession: PublicAuthSession;
+  currentSessionId: string;
+}): Promise<void> {
+  if (typeof auth.listSessions !== 'function') {
+    writeJson(response, 200, {
+      items: [{
+        id: currentSession.id,
+        deviceName: currentSession.deviceName,
+        createdAt: currentSession.createdAt,
+        lastSeenAt: currentSession.lastSeenAt,
+        current: true,
+        principal: currentSession.principal ?? principal,
+      }],
+    });
+    return;
+  }
+  const sessions = await auth.listSessions(principal);
+  writeJson(response, 200, {
+    items: sessions.map((session) => ({
+      id: session.id,
+      deviceName: session.deviceName,
+      createdAt: session.createdAt,
+      lastSeenAt: session.lastSeenAt,
+      current: session.id === currentSessionId,
+      principal: session.principal,
+    })),
+  });
+}
+
+function auditInputFromPrincipal(
+  principal: CodexWebPrincipal,
+  input: CodexWebAuditRecordInput,
+): CodexWebAuditRecordInput {
+  return {
+    ...input,
+    actorUserId: input.actorUserId ?? principal.userId,
+    actorUsername: input.actorUsername ?? principal.username,
+  };
+}
+
+function startTurnAuditMetadata(input: StartTurnInput): Record<string, unknown> {
+  const record = input as StartTurnInput & Record<string, unknown>;
+  return {
+    textLength: typeof input.text === 'string' ? input.text.trim().length : 0,
+    attachmentCount: Array.isArray(input.attachments) ? input.attachments.length : 0,
+    model: normalizeOptionalString(record.model),
+    reasoningEffort: normalizeOptionalString(record.reasoningEffort),
+  };
+}
+
+function terminalAuditMetadata(
+  terminal: CodexWebTerminalSummary,
+  command: string,
+): Record<string, unknown> {
+  return {
+    terminalId: terminal.id,
+    cwd: terminal.cwd,
+    commandLength: command.length,
+  };
+}
+
+function auditApprovalAction(decision: 'accept' | 'accept_for_session' | 'deny'): string {
+  return decision === 'accept_for_session' ? 'approval.accept_for_session' : `approval.${decision}`;
+}
+
+async function recordAuditSafe(
+  auditStore: CodexWebAuditStoreLike,
+  input: CodexWebAuditRecordInput,
+): Promise<void> {
+  try {
+    await auditStore.record(input);
+  } catch (error) {
+    writeRequestLog({
+      level: 'warn',
+      method: 'AUDIT',
+      path: input.action,
+      status: 0,
+      code: 'audit_record_failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 async function handlePublicShareRequest({
   pathname,
   method,
@@ -1335,6 +1719,7 @@ async function handlePublicShareRequest({
   registerSseCloser,
   request,
   url,
+  auditStore,
 }: {
   pathname: string;
   method: string;
@@ -1344,6 +1729,7 @@ async function handlePublicShareRequest({
   registerSseCloser: (close: () => void) => () => void;
   request: IncomingMessage;
   url: URL;
+  auditStore: CodexWebAuditStoreLike;
 }): Promise<boolean> {
   const shareSessionMatch = pathname.match(/^\/api\/share\/([^/]+)\/session$/u);
   const shareEventsMatch = pathname.match(/^\/api\/share\/([^/]+)\/turns\/([^/]+)\/events$/u);
@@ -1382,6 +1768,18 @@ async function handlePublicShareRequest({
       writeSessionNotFound(response);
       return true;
     }
+    await recordAuditSafe(auditStore, {
+      action: 'share.read',
+      actorUsername: 'share-link',
+      projectId: appSession.projectId,
+      codexSessionId: appSession.codexThreadId,
+      metadata: {
+        shareId: share.id,
+        appSessionId: appSession.id,
+        operation: 'turn-events',
+        turnId,
+      },
+    });
     await streamTurnEvents({
       request,
       response,
@@ -1406,6 +1804,17 @@ async function handlePublicShareRequest({
       includeCwd: false,
     }),
   });
+  await recordAuditSafe(auditStore, {
+    action: 'share.read',
+    actorUsername: 'share-link',
+    projectId: appSession.projectId,
+    codexSessionId: appSession.codexThreadId,
+    metadata: {
+      shareId: share.id,
+      appSessionId: appSession.id,
+      operation: 'session',
+    },
+  });
   return true;
 }
 
@@ -1428,6 +1837,7 @@ async function handleMultiUserRequest({
   config,
   workspaceEvents,
   terminalManager,
+  auditStore,
   registerSseCloser,
 }: {
   request: IncomingMessage;
@@ -1444,6 +1854,7 @@ async function handleMultiUserRequest({
   config: CodexWebConfig;
   workspaceEvents: CodexWebWorkspaceEventBus;
   terminalManager: CodexWebTerminalManager;
+  auditStore: CodexWebAuditStoreLike;
   registerSseCloser: (close: () => void) => () => void;
 }): Promise<boolean> {
   if (pathname === '/api/auth/me' || pathname === '/api/auth/logout') {
@@ -1504,6 +1915,12 @@ async function handleMultiUserRequest({
       projectId: project.id,
       favorite: body.favorite,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'project.favorite.updated',
+      sessionId: authContext.session.id,
+      projectId: project.id,
+      metadata: { favorite: body.favorite },
+    }));
     writeJson(response, 200, { projectId: project.id, favorite: body.favorite });
     return true;
   }
@@ -1634,6 +2051,16 @@ async function handleMultiUserRequest({
       archiveSource: null,
     });
     appendWorkspaceSessionEvent(workspaceEvents, 'session.created', appSessionWorkspaceContext(appSession));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.created',
+      sessionId: authContext.session.id,
+      projectId: project.id,
+      codexSessionId: runtimeSession.id,
+      metadata: {
+        appSessionId: appSession.id,
+        modelProvided: Boolean(normalizeOptionalString(body.model)),
+      },
+    }));
     writeJson(response, 201, {
       session: presentSessionForUser({
         runtimeSession,
@@ -1659,6 +2086,9 @@ async function handleMultiUserRequest({
       identityStore,
       identityState,
       auth,
+      principal,
+      auditStore,
+      currentAuthSessionId: authContext.session.id,
     });
     if (handledAdmin) {
       return true;
@@ -1774,6 +2204,16 @@ async function handleMultiUserRequest({
       ...resolved.appSession,
       updatedAt: new Date().toISOString(),
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'terminal.started',
+      sessionId: authContext.session.id,
+      projectId: resolved.appSession.projectId,
+      codexSessionId: resolved.appSession.codexThreadId,
+      metadata: {
+        ...terminalAuditMetadata(terminal, command),
+        appSessionId: resolved.appSession.id,
+      },
+    }));
     writeJson(response, 201, { terminal });
     return true;
   }
@@ -1831,6 +2271,17 @@ async function handleMultiUserRequest({
       return true;
     }
     terminalManager.writeInput(terminalId, body.text);
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'terminal.input',
+      sessionId: authContext.session.id,
+      projectId: terminal.projectId,
+      codexSessionId: terminal.threadId || terminal.sessionId,
+      metadata: {
+        terminalId,
+        appSessionId: terminal.appSessionId,
+        bytes: Buffer.byteLength(body.text),
+      },
+    }));
     writeJson(response, 200, { ok: true });
     return true;
   }
@@ -1855,7 +2306,20 @@ async function handleMultiUserRequest({
       writeSessionNotFound(response);
       return true;
     }
-    writeJson(response, 200, { terminal: await terminalManager.stop(terminalId) });
+    const stopped = await terminalManager.stop(terminalId);
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'terminal.stopped',
+      sessionId: authContext.session.id,
+      projectId: stopped.projectId,
+      codexSessionId: stopped.threadId || stopped.sessionId,
+      metadata: {
+        terminalId,
+        appSessionId: stopped.appSessionId,
+        status: stopped.status,
+        exitCode: stopped.exitCode,
+      },
+    }));
+    writeJson(response, 200, { terminal: stopped });
     return true;
   }
 
@@ -1870,6 +2334,13 @@ async function handleMultiUserRequest({
       sessionId: resolved.appSession.id,
       createdByUserId: principal.userId,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.shared',
+      sessionId: authContext.session.id,
+      projectId: resolved.appSession.projectId,
+      codexSessionId: resolved.appSession.codexThreadId,
+      metadata: { appSessionId: resolved.appSession.id },
+    }));
     writeJson(response, 201, {
       token: created.token,
       shareUrl: `/share/${encodeURIComponent(created.token)}`,
@@ -1944,10 +2415,24 @@ async function handleMultiUserRequest({
     });
     if (action === 'content' && method === 'GET') {
       await writeArtifactJsonResponse(response, () => artifactStore.readContent(artifactId, input));
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'artifact.read',
+        sessionId: authContext.session.id,
+        projectId: resolved.appSession.projectId,
+        codexSessionId: resolved.appSession.codexThreadId,
+        metadata: { appSessionId: resolved.appSession.id, artifactId, operation: 'content' },
+      }));
       return true;
     }
     if (action === 'download' && method === 'GET') {
       await writeArtifactDownloadResponse(response, () => artifactStore.readBinary(artifactId, input));
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'artifact.read',
+        sessionId: authContext.session.id,
+        projectId: resolved.appSession.projectId,
+        codexSessionId: resolved.appSession.codexThreadId,
+        metadata: { appSessionId: resolved.appSession.id, artifactId, operation: 'download' },
+      }));
       return true;
     }
     if (action === 'favorite' && method === 'PATCH') {
@@ -1962,6 +2447,13 @@ async function handleMultiUserRequest({
         await artifactStore.setFavorite(artifactId, favorite);
         return { artifact: await artifactStore.readArtifact(artifactId, input) };
       });
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'artifact.favorite.updated',
+        sessionId: authContext.session.id,
+        projectId: resolved.appSession.projectId,
+        codexSessionId: resolved.appSession.codexThreadId,
+        metadata: { appSessionId: resolved.appSession.id, artifactId, favorite },
+      }));
       return true;
     }
   }
@@ -2018,6 +2510,13 @@ async function handleMultiUserRequest({
       archiveSource: 'codex',
     });
     appendWorkspaceSessionEvent(workspaceEvents, 'session.archived', appSessionWorkspaceContext(resolved.appSession));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.archived',
+      sessionId: authContext.session.id,
+      projectId: resolved.appSession.projectId,
+      codexSessionId: resolved.appSession.codexThreadId,
+      metadata: { appSessionId: resolved.appSession.id, method: 'DELETE' },
+    }));
     writeJson(response, 200, { ok: true });
     return true;
   }
@@ -2054,6 +2553,13 @@ async function handleMultiUserRequest({
         archiveSource: 'codex',
       });
       appendWorkspaceSessionEvent(workspaceEvents, 'session.archived', appSessionWorkspaceContext(resolved.appSession));
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'session.archived',
+        sessionId: authContext.session.id,
+        projectId: resolved.appSession.projectId,
+        codexSessionId: resolved.appSession.codexThreadId,
+        metadata: { appSessionId: resolved.appSession.id, method: 'POST' },
+      }));
       writeJson(response, 200, { ok: true });
       return true;
     }
@@ -2080,6 +2586,13 @@ async function handleMultiUserRequest({
       archiveSource: null,
     });
     appendWorkspaceSessionEvent(workspaceEvents, 'session.unarchived', appSessionWorkspaceContext(updatedAppSession));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.unarchived',
+      sessionId: authContext.session.id,
+      projectId: updatedAppSession.projectId,
+      codexSessionId: updatedAppSession.codexThreadId,
+      metadata: { appSessionId: updatedAppSession.id },
+    }));
     writeJson(response, 200, {
       session: presentSessionForUser({
         runtimeSession: unarchived,
@@ -2163,6 +2676,16 @@ async function handleMultiUserRequest({
       context: appSessionWorkspaceContext(resolved.appSession),
       turn,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'turn.started',
+      sessionId: authContext.session.id,
+      projectId: resolved.appSession.projectId,
+      codexSessionId: resolved.appSession.codexThreadId,
+      metadata: {
+        ...startTurnAuditMetadata(input),
+        appSessionId: resolved.appSession.id,
+      },
+    }));
     writeJson(response, 202, turn);
     return true;
   }
@@ -2194,6 +2717,16 @@ async function handleMultiUserRequest({
       projectCwd,
       projectKey: safePathSegment(resolved.project?.id || resolved.appSession.projectId || `cwd-${stableIdHash(projectCwd, 16)}`),
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.attachments.created',
+      sessionId: authContext.session.id,
+      projectId: resolved.appSession.projectId,
+      codexSessionId: resolved.appSession.codexThreadId,
+      metadata: {
+        appSessionId: resolved.appSession.id,
+        count: items.length,
+      },
+    }));
     writeJson(response, 201, { items });
     return true;
   }
@@ -2223,6 +2756,16 @@ async function handleMultiUserRequest({
       return true;
     }
     appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', appSessionWorkspaceContext(resolved.appSession));
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.settings.updated',
+      sessionId: authContext.session.id,
+      projectId: resolved.appSession.projectId,
+      codexSessionId: resolved.appSession.codexThreadId,
+      metadata: {
+        appSessionId: resolved.appSession.id,
+        keys: Object.keys(body).sort(),
+      },
+    }));
     writeJson(response, 200, {
       session: presentSessionForUser({
         runtimeSession,
@@ -2251,6 +2794,13 @@ async function handleMultiUserRequest({
     } else {
       await runtime.interruptTurn(turnId);
     }
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'turn.interrupted',
+      sessionId: authContext.session.id,
+      projectId: appSession.projectId,
+      codexSessionId: appSession.codexThreadId,
+      metadata: { appSessionId: appSession.id, turnId },
+    }));
     writeJson(response, 200, { ok: true });
     return true;
   }
@@ -2281,6 +2831,17 @@ async function handleMultiUserRequest({
     if (!steered) {
       return true;
     }
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'turn.steered',
+      sessionId: authContext.session.id,
+      projectId: appSession.projectId,
+      codexSessionId: appSession.codexThreadId,
+      metadata: {
+        appSessionId: appSession.id,
+        turnId,
+        textLength: body.text.trim().length,
+      },
+    }));
     writeJson(response, 202, steered);
     return true;
   }
@@ -2308,6 +2869,17 @@ async function handleMultiUserRequest({
     } else {
       await runtime.resolveApproval(approvalId, decision);
     }
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: auditApprovalAction(decision),
+      sessionId: authContext.session.id,
+      projectId: appSession.projectId,
+      codexSessionId: appSession.codexThreadId,
+      metadata: {
+        appSessionId: appSession.id,
+        approvalId,
+        decision,
+      },
+    }));
     writeJson(response, 200, { ok: true });
     return true;
   }
@@ -2343,6 +2915,9 @@ async function handleAdminManagementRequest({
   identityStore,
   identityState,
   auth,
+  principal,
+  auditStore,
+  currentAuthSessionId,
 }: {
   request: IncomingMessage;
   response: ServerResponse;
@@ -2351,6 +2926,9 @@ async function handleAdminManagementRequest({
   identityStore: CodexWebIdentityStoreLike;
   identityState: CodexWebIdentityState;
   auth: CodexWebAuthLike;
+  principal: CodexWebPrincipal;
+  auditStore: CodexWebAuditStoreLike;
+  currentAuthSessionId: string;
 }): Promise<boolean> {
   if (pathname === '/api/admin/settings' && method === 'GET') {
     writeJson(response, 200, { settings: identityState.settings });
@@ -2366,6 +2944,14 @@ async function handleAdminManagementRequest({
     }
     const body = await readJsonBody(request);
     const state = await setMultiUserEnabled(body.multiUserEnabled === true);
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'settings.updated',
+      sessionId: currentAuthSessionId,
+      metadata: {
+        keys: ['multiUserEnabled'],
+        multiUserEnabled: state.settings.multiUserEnabled,
+      },
+    }));
     writeJson(response, 200, { settings: state.settings });
     return true;
   }
@@ -2387,6 +2973,16 @@ async function handleAdminManagementRequest({
       enabled: body.enabled !== false,
       activeSessionLimit: body.activeSessionLimit === null ? null : Number(body.activeSessionLimit),
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'project.updated',
+      sessionId: currentAuthSessionId,
+      projectId: project.id,
+      metadata: {
+        operation: 'upsert',
+        enabled: project.enabled,
+        activeSessionLimit: project.activeSessionLimit,
+      },
+    }));
     writeJson(response, 201, { project });
     return true;
   }
@@ -2413,6 +3009,16 @@ async function handleAdminManagementRequest({
         ? body.activeSessionLimit === null ? null : Number(body.activeSessionLimit)
         : existing.activeSessionLimit,
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'project.updated',
+      sessionId: currentAuthSessionId,
+      projectId: project.id,
+      metadata: {
+        operation: 'patch',
+        keys: Object.keys(body).sort(),
+        enabled: project.enabled,
+      },
+    }));
     writeJson(response, 200, { project });
     return true;
   }
@@ -2437,6 +3043,14 @@ async function handleAdminManagementRequest({
         ? projectIds.map((projectId) => ({ projectId, canRead: true, canCreate: true, canWrite: true }))
         : normalizeRoleProjectGrants(body.projectGrants),
     });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'role.updated',
+      sessionId: currentAuthSessionId,
+      metadata: {
+        roleId: role.id,
+        grantCount: role.projectGrants.length,
+      },
+    }));
     writeJson(response, 201, { role });
     return true;
   }
@@ -2466,6 +3080,18 @@ async function handleAdminManagementRequest({
         roleIds,
         directProjectGrants: Array.isArray(body.directProjectGrants) ? body.directProjectGrants as any[] : [],
       });
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'user.updated',
+        sessionId: currentAuthSessionId,
+        targetUserId: user.id,
+        metadata: {
+          operation: 'create',
+          username: user.username,
+          enabled: user.enabled,
+          roleIds: user.roleIds,
+          directProjectGrantCount: user.directProjectGrants.length,
+        },
+      }));
       writeJson(response, 201, { user: presentAdminUser(user) });
     } catch (error) {
       if (isUsernameConflictError(error)) {
@@ -2500,6 +3126,18 @@ async function handleAdminManagementRequest({
         roleIds,
         directProjectGrants: Array.isArray(body.directProjectGrants) ? body.directProjectGrants as any[] : undefined,
       });
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'user.updated',
+        sessionId: currentAuthSessionId,
+        targetUserId: user.id,
+        metadata: {
+          operation: 'patch',
+          username: user.username,
+          enabled: user.enabled,
+          roleIds: user.roleIds,
+          keys: Object.keys(body).filter((key) => key !== 'password').sort(),
+        },
+      }));
       writeJson(response, 200, { user: presentAdminUser(user) });
     } catch {
       writeSessionNotFound(response);
@@ -2512,7 +3150,14 @@ async function handleAdminManagementRequest({
       return true;
     }
     try {
-      await identityStore.deleteUser(decodeURIComponent(adminUserMatch[1]!));
+      const targetUserId = decodeURIComponent(adminUserMatch[1]!);
+      await identityStore.deleteUser(targetUserId);
+      await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+        action: 'user.deleted',
+        sessionId: currentAuthSessionId,
+        targetUserId,
+        metadata: { operation: 'delete' },
+      }));
       response.statusCode = 204;
       response.end();
     } catch {

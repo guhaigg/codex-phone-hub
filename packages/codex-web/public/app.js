@@ -76,6 +76,9 @@ const state = {
   runtimeHealthLoading: false,
   diagnostics: null,
   diagnosticsLoading: false,
+  authSessions: [],
+  auditItems: [],
+  securityLoading: false,
   model: "",
   view: "sessions",
   isMobile: window.innerWidth < 820,
@@ -1229,12 +1232,78 @@ function renderSettings(mobile) {
             <button class="ghost-action danger" type="button" id="clear-cache">清理缓存</button>
           </div>
         </section>
+        ${renderSecuritySummary()}
         <div class="settings-actions">
           <button class="primary" type="submit">${state.settingsSaving ? "保存中..." : "保存设置"}</button>
           <button class="logout-btn" type="button" id="logout-button">退出登录</button>
         </div>
       </form>
     </section>
+  `;
+}
+
+function renderSecuritySummary() {
+  const authSessions = Array.isArray(state.authSessions) ? state.authSessions : [];
+  const auditItems = Array.isArray(state.auditItems) ? state.auditItems : [];
+  return `
+    <section class="open-section">
+      <div class="section-kicker">安全</div>
+      <div class="security-head">
+        <div>
+          <strong>我的设备</strong>
+          <small>${authSessions.length ? `${authSessions.length} 个已登录设备` : "按需加载设备会话"}</small>
+        </div>
+        <button class="ghost-action" type="button" id="refresh-security">${state.securityLoading ? "刷新中..." : "刷新安全状态"}</button>
+      </div>
+      <div class="security-list">
+        ${authSessions.length ? authSessions.map(renderAuthSessionRow).join("") : `
+          <div class="setting-row">
+            <span class="setting-icon">${icon("user")}</span>
+            <span class="setting-copy"><strong>我的设备</strong><small>暂无设备记录</small></span>
+          </div>
+        `}
+      </div>
+      <div class="security-head security-audit-head">
+        <div>
+          <strong>操作记录</strong>
+          <small>${auditItems.length ? "最近安全操作" : "暂无审计记录"}</small>
+        </div>
+      </div>
+      <div class="security-list">
+        ${auditItems.length ? auditItems.slice(0, 8).map(renderAuditRow).join("") : `
+          <div class="setting-row">
+            <span class="setting-icon">${icon("clipboard")}</span>
+            <span class="setting-copy"><strong>操作记录</strong><small>登录、退出和设备撤销会显示在这里</small></span>
+          </div>
+        `}
+      </div>
+    </section>
+  `;
+}
+
+function renderAuthSessionRow(session) {
+  const current = session?.current === true;
+  return `
+    <div class="setting-row security-row">
+      <span class="setting-icon">${icon(current ? "check" : "user")}</span>
+      <span class="setting-copy">
+        <strong>${escapeHtml(session?.deviceName || "Unknown device")}</strong>
+        <small>${current ? "当前设备" : "其他设备"} · 最近 ${escapeHtml(formatTime(session?.lastSeenAt))}</small>
+      </span>
+      ${current ? "" : `<button class="ghost-action danger compact-action" type="button" data-revoke-auth-session="${escapeAttribute(session?.id || "")}">撤销</button>`}
+    </div>
+  `;
+}
+
+function renderAuditRow(item) {
+  return `
+    <div class="setting-row security-row">
+      <span class="setting-icon">${icon(auditIcon(item?.action))}</span>
+      <span class="setting-copy">
+        <strong>${escapeHtml(auditActionLabel(item?.action))}</strong>
+        <small>${escapeHtml(formatTime(item?.timestamp))}${item?.targetSessionId ? ` · ${escapeHtml(item.targetSessionId)}` : ""}</small>
+      </span>
+    </div>
   `;
 }
 
@@ -1833,10 +1902,14 @@ function bindApp(root = document) {
   qs("#refresh-usage")?.addEventListener("click", () => refreshUsage());
   qs("#refresh-runtime-health")?.addEventListener("click", () => refreshRuntimeHealth());
   qs("#refresh-diagnostics")?.addEventListener("click", () => refreshDiagnostics());
+  qs("#refresh-security")?.addEventListener("click", () => refreshSecurityState());
   qs("#reload-runtime")?.addEventListener("click", reloadRuntime);
   qs("#logout-button")?.addEventListener("click", logout);
   qs("#clear-cache")?.addEventListener("click", clearLocalCache);
   qs("#settings-form")?.addEventListener("submit", saveSettingsForm);
+  for (const button of qsa("[data-revoke-auth-session]")) {
+    button.addEventListener("click", () => revokeAuthSession(button.getAttribute("data-revoke-auth-session") || ""));
+  }
   qs("#attach-button")?.addEventListener("click", () => qs("#file-input")?.click());
   qs("#file-input")?.addEventListener("change", (event) => {
     state.selectedFiles = [...state.selectedFiles, ...Array.from(event.target.files || [])].slice(0, 8);
@@ -2104,6 +2177,7 @@ async function setView(view) {
       refreshModels().catch(() => null),
       refreshRuntimeHealth({ silent: true }).catch(() => null),
       refreshDiagnostics({ silent: true }).catch(() => null),
+      refreshSecurityState({ silent: true }).catch(() => null),
     ]);
     renderAfterBackgroundRefresh();
   }
@@ -2189,6 +2263,46 @@ async function refreshDiagnostics({ silent = false } = {}) {
   } finally {
     state.diagnosticsLoading = false;
     if (!silent) render();
+  }
+}
+
+async function refreshSecurityState({ silent = false } = {}) {
+  state.securityLoading = true;
+  if (!silent) {
+    state.notice = "正在刷新安全状态";
+    render();
+  }
+  try {
+    const [sessionsPayload, auditPayload] = await Promise.all([
+      apiFetch("/api/auth/sessions").catch(() => ({ items: [] })),
+      apiFetch("/api/admin/audit?limit=8").catch(() => ({ items: [] })),
+    ]);
+    state.authSessions = Array.isArray(sessionsPayload?.items) ? sessionsPayload.items : [];
+    state.auditItems = Array.isArray(auditPayload?.items) ? auditPayload.items : [];
+    if (!silent) state.notice = "安全状态已刷新";
+  } catch (error) {
+    if (!silent) state.notice = error?.payload?.message || error?.message || "安全状态读取失败";
+  } finally {
+    state.securityLoading = false;
+    if (!silent) render();
+  }
+}
+
+async function revokeAuthSession(sessionId) {
+  const target = String(sessionId || "").trim();
+  if (!target) return;
+  state.securityLoading = true;
+  state.notice = "正在撤销设备";
+  render();
+  try {
+    await apiFetch(`/api/auth/sessions/${encodeURIComponent(target)}`, { method: "DELETE" });
+    await refreshSecurityState({ silent: true });
+    state.notice = "设备已撤销";
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "设备撤销失败";
+  } finally {
+    state.securityLoading = false;
+    render();
   }
 }
 
@@ -4263,6 +4377,62 @@ function usageText() {
     parts.push(`${key}: ${value}`);
   }
   return parts.slice(0, 3).join(" · ") || "已连接";
+}
+
+function auditActionLabel(action) {
+  const normalized = String(action || "").trim();
+  const labels = {
+    "auth.login.success": "登录成功",
+    "auth.login.failure": "登录失败",
+    "auth.login.rate_limited": "登录限流",
+    "auth.logout": "退出登录",
+    "auth.session.revoked": "撤销设备",
+    "settings.updated": "设置更新",
+    "project.updated": "项目更新",
+    "project.favorite.updated": "项目收藏",
+    "role.updated": "角色更新",
+    "user.updated": "用户更新",
+    "user.deleted": "用户删除",
+    "session.created": "新建对话",
+    "session.archived": "归档对话",
+    "session.unarchived": "恢复对话",
+    "session.shared": "分享对话",
+    "session.favorite.updated": "对话收藏",
+    "session.settings.updated": "对话设置",
+    "session.attachments.created": "上传附件",
+    "session.timeline.appended": "追加记录",
+    "turn.started": "发送任务",
+    "turn.steered": "追加指令",
+    "turn.interrupted": "中断任务",
+    "approval.accept": "批准操作",
+    "approval.accept_for_session": "本会话批准",
+    "approval.deny": "拒绝操作",
+    "terminal.started": "启动终端",
+    "terminal.input": "终端输入",
+    "terminal.stopped": "停止终端",
+    "skill.updated": "技能更新",
+    "plugin.updated": "插件更新",
+    "mcp.updated": "MCP 更新",
+    "mcp.oauth.started": "MCP 授权",
+    "app.updated": "应用更新",
+    "config.updated": "配置更新",
+    "artifact.read": "读取产物",
+    "artifact.favorite.updated": "收藏产物",
+    "report.favorite.updated": "收藏报告",
+    "share.read": "读取分享",
+  };
+  return labels[normalized] || normalized || "操作记录";
+}
+
+function auditIcon(action) {
+  const normalized = String(action || "").toLowerCase();
+  if (normalized.includes("failure") || normalized.includes("deny") || normalized.includes("rate_limited")) return "info";
+  if (normalized.includes("terminal")) return "code";
+  if (normalized.includes("plugin") || normalized.includes("skill") || normalized.includes("mcp") || normalized.includes("config") || normalized.includes("settings") || normalized.includes("app.")) return "sliders";
+  if (normalized.includes("project") || normalized.includes("role")) return "layers";
+  if (normalized.includes("share") || normalized.includes("artifact")) return "doc";
+  if (normalized.includes("logout") || normalized.includes("revoked") || normalized.includes("user")) return "user";
+  return "check";
 }
 
 function runtimeHealthText() {

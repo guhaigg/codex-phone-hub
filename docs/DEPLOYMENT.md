@@ -1,14 +1,15 @@
 # Deployment
 
-Codex Phone Hub is deployed on a host that already has Codex CLI installed and
-logged in. The browser is only the UI; code execution, file access, and Codex
-credentials stay on the host.
+Codex Phone Hub is deployed on a host that already has a working Codex CLI and
+provider configuration. Official OpenAI login is not required when the host
+Codex CLI is configured for a third-party API provider. The browser is only the
+UI; code execution, file access, and provider credentials stay on the host.
 
 ## Requirements
 
 - Node.js `>=24`
 - npm
-- A local Codex CLI login on the host
+- A working Codex CLI/provider configuration on the host
 - A working checkout of this repository
 - Optional: reverse proxy, tunnel, or LAN-only access, managed outside this repo
 
@@ -106,6 +107,32 @@ GET /api/diagnostics/summary
 The response is intentionally non-fatal for third-party API setups: official
 usage being unavailable is reported as diagnostics, not as a Codex runtime
 failure.
+
+## Security audit and devices
+
+Audit records are append-only JSONL under the configured state directory:
+
+```text
+~/.codex-web/audit-log.jsonl
+```
+
+Authenticated clients can list and revoke web login devices:
+
+```text
+GET /api/auth/sessions
+DELETE /api/auth/sessions/:id
+```
+
+Admins can read recent audit entries:
+
+```text
+GET /api/admin/audit?cursor=&limit=&actor=&project=&action=
+```
+
+The settings page shows this as the personal "我的设备" and "操作记录" sections.
+Audit metadata intentionally excludes passwords, bearer tokens, prompt text,
+configuration values, uploaded file contents, terminal input text, and terminal
+output.
 
 ## Backups and upgrades
 

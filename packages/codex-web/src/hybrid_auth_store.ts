@@ -13,6 +13,8 @@ interface LegacyAuthLike {
   }): Promise<{ token: string; session: PublicAuthSession; configuredNow: boolean }>;
   verifyToken(token: string | null | undefined): Promise<PublicAuthSession | null>;
   logout(token: string | null | undefined): Promise<void>;
+  listSessions?(): Promise<PublicAuthSession[]>;
+  revokeSession?(sessionId: string): Promise<boolean>;
   setPassword?(password: string): Promise<void>;
   readPasswordHash?(): Promise<PasswordHashRecord | null>;
 }
@@ -220,6 +222,56 @@ export class HybridAuthStore {
       return;
     }
     await this.legacyAuth.logout(normalized);
+  }
+
+  async listSessions(principal?: CodexWebPrincipal | null): Promise<PublicAuthSession[]> {
+    const state = await this.identityStore.readState();
+    if (!state.settings.multiUserEnabled) {
+      const sessions = await this.legacyAuth.listSessions?.() ?? [];
+      return sessions.map((session) => ({
+        ...session,
+        principal: session.principal ?? localAdminPrincipal(),
+      }));
+    }
+    const visibleUserId = principal?.isAdmin && principal.userId !== 'local-admin'
+      ? null
+      : principal?.userId ?? null;
+    const sessions = state.userSessions
+      .filter((session) => !visibleUserId || session.userId === visibleUserId);
+    return sessions.flatMap((session) => {
+      const user = state.users.find((item) => item.id === session.userId && item.enabled !== false);
+      if (!user) {
+        return [];
+      }
+      return [toPublicSession(session, {
+        userId: user.id,
+        username: user.username,
+        roleIds: [...user.roleIds],
+        isAdmin: user.roleIds.some((roleId) => state.roles.some((role) => role.id === roleId && role.isAdmin === true)),
+        mode: 'multi',
+      })];
+    });
+  }
+
+  async revokeSession(sessionId: string, principal?: CodexWebPrincipal | null): Promise<boolean> {
+    const normalizedSessionId = String(sessionId ?? '').trim();
+    if (!normalizedSessionId) {
+      return false;
+    }
+    const state = await this.identityStore.readState();
+    if (!state.settings.multiUserEnabled) {
+      return await this.legacyAuth.revokeSession?.(normalizedSessionId) ?? false;
+    }
+    const existing = state.userSessions.find((session) => session.id === normalizedSessionId);
+    if (!existing) {
+      return false;
+    }
+    if (!principal?.isAdmin && existing.userId !== principal?.userId) {
+      return false;
+    }
+    this.sessions.delete(normalizedSessionId);
+    await this.identityStore.deleteUserSession?.(normalizedSessionId);
+    return true;
   }
 }
 

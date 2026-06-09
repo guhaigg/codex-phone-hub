@@ -130,6 +130,28 @@ export class AuthStore {
     });
   }
 
+  async listSessions(): Promise<PublicAuthSession[]> {
+    const state = await this.readState();
+    return state.sessions.map(toPublicSession);
+  }
+
+  async revokeSession(sessionId: string): Promise<boolean> {
+    const normalized = normalizeToken(sessionId);
+    if (!normalized) {
+      return false;
+    }
+    return this.withMutationLock(async () => {
+      const state = await this.readState();
+      const before = state.sessions.length;
+      state.sessions = state.sessions.filter((session) => session.id !== normalized);
+      if (state.sessions.length === before) {
+        return false;
+      }
+      await this.writeState(state);
+      return true;
+    });
+  }
+
   async logout(token: string | null | undefined): Promise<void> {
     const normalized = normalizeToken(token);
     if (!normalized) {

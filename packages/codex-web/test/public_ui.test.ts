@@ -105,6 +105,16 @@ test('public UI copy is specific to Codex Remote Workbench and has no borrowed p
   }
 });
 
+test('settings page exposes personal devices and audit history without multi-role noise', async () => {
+  const app = await readFile(appUrl, 'utf8');
+
+  assert.match(app, /我的设备/u);
+  assert.match(app, /操作记录/u);
+  assert.match(app, /\/api\/auth\/sessions/u);
+  assert.match(app, /\/api\/admin\/audit/u);
+  assert.doesNotMatch(app, /Team audit/u);
+});
+
 test('mobile UI tries to lock mobile browsers to portrait orientation', async () => {
   const lockCalls: string[] = [];
   await loadAppHarness({

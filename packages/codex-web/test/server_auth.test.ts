@@ -7,6 +7,7 @@ import { FileIdentityStore } from '../src/identity_store.js';
 import { createCodexWebServer } from '../src/server.js';
 import { CodexWebWorkspaceEventBus } from '../src/workspace_event_bus.js';
 import { FileArtifactStore } from '../src/artifact_store.js';
+import { FileAuditStore } from '../src/audit_store.js';
 
 interface TestConfig {
   host: string;
@@ -114,6 +115,261 @@ test('API routes accept valid bearer token', async () => {
     assert.equal((await response.json()).ok, true);
   } finally {
     await server.stop();
+  }
+});
+
+test('auth session APIs list devices, revoke another device, and audit without token leaks', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-auth-sessions-'));
+  const auditStore = new FileAuditStore({ auditPath: path.join(stateDir, 'audit-log.jsonl') });
+  const sessions = [
+    {
+      id: 'session_current',
+      deviceName: 'Mac Safari',
+      createdAt: '2026-06-09T10:00:00.000Z',
+      lastSeenAt: '2026-06-09T10:01:00.000Z',
+    },
+    {
+      id: 'session_phone',
+      deviceName: 'iPhone PWA',
+      createdAt: '2026-06-09T10:02:00.000Z',
+      lastSeenAt: '2026-06-09T10:03:00.000Z',
+    },
+  ];
+  const revoked: string[] = [];
+  const server = createCodexWebServer({
+    auth: {
+      isConfigured: async () => true,
+      login: async () => ({ token: 'cw_token_secret', session: sessions[0]!, configuredNow: false }),
+      verifyToken: async (token) => token === 'cw_token_secret'
+        ? { ...sessions[0]!, principal: { userId: 'local-admin', username: 'local', roleIds: [], isAdmin: true, mode: 'single' as const } }
+        : null,
+      logout: async () => {},
+      listSessions: async () => sessions,
+      revokeSession: async (sessionId: string) => {
+        revoked.push(sessionId);
+        const index = sessions.findIndex((session) => session.id === sessionId);
+        if (index >= 0) {
+          sessions.splice(index, 1);
+          return true;
+        }
+        return false;
+      },
+    },
+    runtime: createRuntimeStub() as any,
+    config: createConfig({ stateDir }),
+    auditStore,
+  });
+  await server.start();
+  try {
+    const listResponse = await fetch(`${server.baseUrl}/api/auth/sessions`, {
+      headers: { Authorization: 'Bearer cw_token_secret' },
+    });
+    assert.equal(listResponse.status, 200);
+    const listPayload = await listResponse.json() as any;
+    assert.deepEqual(listPayload.items.map((session: any) => ({
+      id: session.id,
+      current: session.current,
+      deviceName: session.deviceName,
+      tokenHash: session.tokenHash,
+    })), [
+      { id: 'session_current', current: true, deviceName: 'Mac Safari', tokenHash: undefined },
+      { id: 'session_phone', current: false, deviceName: 'iPhone PWA', tokenHash: undefined },
+    ]);
+
+    const revokeResponse = await fetch(`${server.baseUrl}/api/auth/sessions/session_phone`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer cw_token_secret' },
+    });
+    assert.equal(revokeResponse.status, 200);
+    assert.deepEqual(await revokeResponse.json(), { ok: true });
+    assert.deepEqual(revoked, ['session_phone']);
+
+    const auditResponse = await fetch(`${server.baseUrl}/api/admin/audit`, {
+      headers: { Authorization: 'Bearer cw_token_secret' },
+    });
+    assert.equal(auditResponse.status, 200);
+    const auditPayload = await auditResponse.json() as any;
+    assert.equal(auditPayload.items[0].action, 'auth.session.revoked');
+    assert.equal(auditPayload.items[0].targetSessionId, 'session_phone');
+    assert.equal(JSON.stringify(auditPayload).includes('cw_token_secret'), false);
+  } finally {
+    await server.stop();
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('auth session list falls back to the current device when auth store cannot enumerate sessions', async () => {
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: createRuntimeStub() as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/auth/sessions`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json() as any;
+    assert.equal(payload.items.length, 1);
+    assert.equal(payload.items[0].id, 's1');
+    assert.equal(payload.items[0].deviceName, 'phone');
+    assert.equal(payload.items[0].current, true);
+    assert.equal(payload.items[0].principal.userId, 'local-admin');
+    assert.equal(payload.items[0].principal.isAdmin, true);
+    assert.equal(payload.items[0].principal.mode, 'single');
+  } finally {
+    await server.stop();
+  }
+});
+
+test('single-user write APIs emit redacted audit metadata', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-write-audit-'));
+  const auditStore = new FileAuditStore({ auditPath: path.join(stateDir, 'audit-log.jsonl') });
+  const calls: string[] = [];
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      createSession: async () => ({ id: 'thread_1', cwd: stateDir }),
+      readSession: async (sessionId: string) => sessionId === 'thread_1' ? { id: sessionId, cwd: stateDir } : null,
+      startTurn: async (sessionId: string, input: any) => {
+        calls.push(`turn:${sessionId}:${input.text}`);
+        return { turnId: 'turn_1' };
+      },
+      steerTurn: async (turnId: string, input: any) => {
+        calls.push(`steer:${turnId}:${input.text}`);
+        return { ok: true };
+      },
+      interruptTurn: async (turnId: string) => {
+        calls.push(`interrupt:${turnId}`);
+      },
+      resolveApproval: async (approvalId: string, decision: string) => {
+        calls.push(`approval:${approvalId}:${decision}`);
+      },
+      setSkillEnabled: async ({ name, enabled }: { name?: string | null; enabled: boolean }) => {
+        calls.push(`skill:${name}:${enabled}`);
+      },
+      setMcpServerEnabled: async ({ name, enabled }: { name: string; enabled: boolean }) => {
+        calls.push(`mcp:${name}:${enabled}`);
+      },
+      setAppEnabled: async ({ appId, enabled }: { appId: string; enabled: boolean }) => {
+        calls.push(`app:${appId}:${enabled}`);
+      },
+      writeRuntimeConfigValue: async ({ keyPath, value }: { keyPath: string; value: unknown }) => {
+        calls.push(`config:${keyPath}:${String(value)}`);
+      },
+    } as any,
+    config: createConfig({ stateDir }),
+    auditStore,
+  });
+  await server.start();
+  try {
+    const headers = {
+      Authorization: 'Bearer cw_token',
+      'Content-Type': 'application/json',
+    };
+    await fetch(`${server.baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ cwd: stateDir }),
+    });
+    await fetch(`${server.baseUrl}/api/sessions/thread_1/turns`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ text: 'prompt AUDIT_PROMPT_SECRET' }),
+    });
+    await fetch(`${server.baseUrl}/api/turns/turn_1/steer`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ text: 'steer AUDIT_STEER_SECRET' }),
+    });
+    await fetch(`${server.baseUrl}/api/turns/turn_1/interrupt`, {
+      method: 'POST',
+      headers,
+    });
+    await fetch(`${server.baseUrl}/api/approvals/approval_1/deny`, {
+      method: 'POST',
+      headers,
+    });
+    const terminalStartResponse = await fetch(`${server.baseUrl}/api/sessions/thread_1/terminal`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ command: 'node -e "setTimeout(() => {}, 5000)" # AUDIT_TERMINAL_SECRET' }),
+    });
+    assert.equal(terminalStartResponse.status, 201);
+    const terminalPayload = await terminalStartResponse.json() as any;
+    await fetch(`${server.baseUrl}/api/terminals/${encodeURIComponent(terminalPayload.terminal.id)}/input`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ text: 'AUDIT_TERMINAL_INPUT_SECRET\n' }),
+    });
+    await fetch(`${server.baseUrl}/api/terminals/${encodeURIComponent(terminalPayload.terminal.id)}/stop`, {
+      method: 'POST',
+      headers,
+    });
+    await fetch(`${server.baseUrl}/api/skills`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ name: 'frontend-design', enabled: false }),
+    });
+    await fetch(`${server.baseUrl}/api/mcp`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ name: 'github', enabled: false }),
+    });
+    await fetch(`${server.baseUrl}/api/apps`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ appId: 'github', enabled: true }),
+    });
+    await fetch(`${server.baseUrl}/api/config/value`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ keyPath: 'model_provider.api_key', value: 'AUDIT_CONFIG_SECRET' }),
+    });
+    await fetch(`${server.baseUrl}/api/sessions/thread_1/archive`, {
+      method: 'POST',
+      headers,
+    });
+
+    const auditResponse = await fetch(`${server.baseUrl}/api/admin/audit?limit=100`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(auditResponse.status, 200);
+    const auditPayload = await auditResponse.json() as any;
+    const actions = new Set(auditPayload.items.map((item: any) => item.action));
+    for (const action of [
+      'session.created',
+      'turn.started',
+      'turn.steered',
+      'turn.interrupted',
+      'approval.deny',
+      'terminal.started',
+      'terminal.input',
+      'terminal.stopped',
+      'skill.updated',
+      'mcp.updated',
+      'app.updated',
+      'config.updated',
+      'session.archived',
+    ]) {
+      assert.equal(actions.has(action), true, `missing audit action ${action}`);
+    }
+    const rawAudit = JSON.stringify(auditPayload);
+    for (const secret of [
+      'AUDIT_PROMPT_SECRET',
+      'AUDIT_STEER_SECRET',
+      'AUDIT_TERMINAL_SECRET',
+      'AUDIT_TERMINAL_INPUT_SECRET',
+      'AUDIT_CONFIG_SECRET',
+    ]) {
+      assert.equal(rawAudit.includes(secret), false, `audit leaked ${secret}`);
+    }
+    assert.deepEqual(calls.filter((call) => call.startsWith('config:')), ['config:model_provider.api_key:AUDIT_CONFIG_SECRET']);
+  } finally {
+    await server.stop();
+    await fs.rm(stateDir, { recursive: true, force: true });
   }
 });
 
