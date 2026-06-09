@@ -11,8 +11,8 @@ usage() {
   cat <<'USAGE'
 Usage: backup-codex-web-state.sh [options]
 
-Backs up the Codex Web application checkout metadata, ~/.codex-web state,
-service.env, and an optional nginx site file into /opt/codex-web/backups.
+Backs up the Codex Web application checkout, ~/.codex-web state, service.env,
+and an optional nginx site file into /opt/codex-web/backups.
 
 Options:
   --app-dir PATH       Application checkout, default /opt/codex-web
@@ -55,7 +55,7 @@ if [[ -d "${APP_DIR}/.git" ]]; then
   git -C "${APP_DIR}" diff > "${backup_dir}/git-diff.patch" || true
 fi
 
-source_archive="${backup_dir}/source-metadata.tar.gz"
+source_archive="${backup_dir}/source.tar.gz"
 tar \
   --exclude='.git' \
   --exclude='node_modules' \
@@ -117,7 +117,8 @@ cat > "${manifest}" <<JSON
   "serviceEnvSha256": "${env_copy_sha}",
   "nginxSite": "${nginx_copy_name}",
   "nginxSiteSha256": "${nginx_copy_sha}",
-  "restoreCommand": "scripts/service/restore-codex-web-state.sh --backup ${backup_dir}"
+  "restoreCommand": "scripts/service/restore-codex-web-state.sh --backup ${backup_dir}",
+  "rollbackCommand": "scripts/service/rollback-codex-web-release.sh --backup ${backup_dir}"
 }
 JSON
 

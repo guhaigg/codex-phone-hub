@@ -132,6 +132,32 @@ systemctl restart codex-web.service
 scripts/service/status-codex-web-linux.sh
 ```
 
+Restore state from a backup when auth/session/report state or `service.env`
+needs recovery:
+
+```bash
+systemctl stop codex-web.service
+scripts/service/restore-codex-web-state.sh \
+  --backup /opt/codex-web/backups/YYYYMMDD-HHMMSS \
+  --state-dir /root/.codex-web \
+  --env-path /root/.config/codex-web/service.env
+systemctl start codex-web.service
+scripts/service/status-codex-web-linux.sh
+```
+
+For an emergency source rollback to a previous backup archive:
+
+```bash
+scripts/service/rollback-codex-web-release.sh \
+  --backup /opt/codex-web/backups/YYYYMMDD-HHMMSS \
+  --app-dir /opt/codex-web
+scripts/service/status-codex-web-linux.sh
+```
+
+`restore-codex-web-state.sh --dry-run` previews file changes. Without
+`--force`, restore refuses to overwrite state while `codex-web.service` is
+active.
+
 ## Production hygiene
 
 - Keep `~/.codex`, `~/.codex-web`, `.env`, logs, backups, and upload folders out
