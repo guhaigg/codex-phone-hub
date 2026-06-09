@@ -308,6 +308,14 @@ export class CodexWebRuntime {
     return this.client.readUsage();
   }
 
+  getActiveTurnCount(): number {
+    const turnIds = new Set<string>(this.activeTurns.keys());
+    for (const record of this.activeTurnStore?.listActive() ?? []) {
+      turnIds.add(record.turnId);
+    }
+    return turnIds.size;
+  }
+
   async listSessions(options: ListSessionsOptions = {}): Promise<CodexWebSession[]> {
     if (options.favorite === true) {
       return this.listFavoriteSessions();

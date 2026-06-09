@@ -58,6 +58,7 @@ import {
   inspectWorkspaceFile,
   inspectWorkspaceStatus,
 } from './workspace_inspector.js';
+import { collectDiagnosticsSummary } from './diagnostics.js';
 
 export interface CodexWebAuthLike {
   isConfigured(): Promise<boolean>;
@@ -538,6 +539,19 @@ async function handleRequest({
 
   if (pathname === '/api/runtime/health' && method === 'GET') {
     writeJson(response, 200, { health: await readRuntimeHealth(runtime) });
+    return;
+  }
+
+  if (pathname === '/api/diagnostics/summary' && method === 'GET') {
+    writeJson(response, 200, {
+      summary: await collectDiagnosticsSummary({
+        config,
+        authConfigured: configured,
+        identityState,
+        runtime,
+        terminalCount: terminalManager.list().length,
+      }),
+    });
     return;
   }
 

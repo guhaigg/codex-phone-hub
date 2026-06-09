@@ -73,3 +73,25 @@ test('macOS installer script installs dependencies, configures password, and opt
   assert.match(script, /install-codex-web-launchd-user\.sh/u);
   assert.match(script, /--autostart/u);
 });
+
+test('linux systemd operations scripts cover install, backup, status, and health checks', async () => {
+  const installer = await readScript('scripts/install/install-codex-web-linux-systemd.sh');
+  const status = await readScript('scripts/service/status-codex-web-linux.sh');
+  const backup = await readScript('scripts/service/backup-codex-web-state.sh');
+
+  assert.match(installer, /codex-web\.service/u);
+  assert.match(installer, /CODEX_WEB_HOST=127\.0\.0\.1/u);
+  assert.match(installer, /CODEX_WEB_PORT=43210/u);
+  assert.match(installer, /systemctl daemon-reload/u);
+  assert.doesNotMatch(installer, /reboot/u);
+
+  assert.match(status, /systemctl is-active codex-web\.service/u);
+  assert.match(status, /curl .*\/api\/health/u);
+  assert.match(status, /\/var\/run\/reboot-required/u);
+  assert.match(status, /apt list --upgradable/u);
+
+  assert.match(backup, /~\/\.codex-web/u);
+  assert.match(backup, /service\.env/u);
+  assert.match(backup, /backup-manifest\.json/u);
+  assert.match(backup, /tar /u);
+});

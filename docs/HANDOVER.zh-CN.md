@@ -391,14 +391,14 @@ admin role select: sameNode=true, activeAfter=true
 
 ```bash
 cd /opt/codex-web
-git fetch origin
-git status
-git pull --ff-only
+scripts/service/backup-codex-web-state.sh
+git pull --ff-only origin main
 npm install
+npm run build --workspaces --if-present
 npm run typecheck --workspaces --if-present
 npm test --workspaces --if-present
 systemctl restart codex-web.service
-systemctl status codex-web.service
+scripts/service/status-codex-web-linux.sh
 ```
 
 如果生产目录不是 Git checkout，而是手工发布目录：
@@ -412,9 +412,21 @@ systemctl status codex-web.service
 升级前建议备份：
 
 ```bash
-mkdir -p /opt/codex-web/backups/$(date +%Y%m%d-%H%M%S)
-cp -a ~/.codex-web /opt/codex-web/backups/$(date +%Y%m%d-%H%M%S)/codex-web-state
+cd /opt/codex-web
+scripts/service/backup-codex-web-state.sh \
+  --app-dir /opt/codex-web \
+  --state-dir /root/.codex-web \
+  --env-path /root/.config/codex-web/service.env
 ```
+
+线上状态检查：
+
+```bash
+cd /opt/codex-web
+scripts/service/status-codex-web-linux.sh
+```
+
+Web 端设置页会调用 `GET /api/diagnostics/summary` 展示系统重启标记、可升级包数量、service 状态、状态目录可写性、最近备份和 provider/usage 状态。`/var/run/reboot-required` 为 `yes` 只表示 Linux 内核或基础包更新后建议安排维护窗口重启，不表示 `codex-web.service` 本身异常；第三方 API 模式下官方用量不可读也不影响 Codex CLI 运行。
 
 ## 9. 后续开发路线
 
@@ -427,11 +439,11 @@ cp -a ~/.codex-web /opt/codex-web/backups/$(date +%Y%m%d-%H%M%S)/codex-web-state
    - 每次项目/用户/角色保存后显示明确成功/失败状态。
    - session audit 支持更细的筛选和导出。
 3. 完善生产部署脚本
-   - 增加 Linux systemd 安装脚本。
-   - 增加一键健康检查脚本。
+   - Linux systemd 安装脚本已加入：`scripts/install/install-codex-web-linux-systemd.sh`。
+   - 一键健康检查脚本已加入：`scripts/service/status-codex-web-linux.sh`。
 4. 加强备份/恢复
-   - `~/.codex-web` 状态备份。
-   - identity/auth/report index 恢复说明。
+   - 备份脚本已加入：`scripts/service/backup-codex-web-state.sh`。
+   - 仍需补充 restore/rollback 脚本和恢复演练。
 
 ### 9.2 中优先级
 

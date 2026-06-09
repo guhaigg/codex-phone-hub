@@ -72,6 +72,7 @@ globalThis.__adminRenderTest = {
   renderViewTabs,
   renderAdminBody,
   renderCapabilities,
+  renderSettings,
 };`, context);
   return context.__adminRenderTest as {
     state: any;
@@ -79,6 +80,7 @@ globalThis.__adminRenderTest = {
     renderViewTabs: (mobile: boolean) => string;
     renderAdminBody: () => string;
     renderCapabilities: (mobile: boolean) => string;
+    renderSettings: (mobile: boolean) => string;
   };
 }
 
@@ -172,6 +174,39 @@ test('personal workbench renders ecosystem controls without multi-role managemen
   assert.doesNotMatch(html, /角色/u);
   assert.doesNotMatch(html, /用户/u);
   assert.ok(html.length < 180_000, `capability markup should stay bounded, got ${html.length} bytes`);
+});
+
+test('settings page summarizes production diagnostics without multi-role noise', () => {
+  const api = loadRenderHarness();
+  api.state.authSession = { id: 'auth_1', principal: { userId: 'local-admin', username: 'admin', mode: 'single', isAdmin: true } };
+  api.state.permissions = { canSetSiteTitle: true };
+  api.state.diagnostics = {
+    checkedAt: '2026-06-10T01:02:03.000Z',
+    system: {
+      reboot: { required: true, packages: ['linux-image-6.8.0-124-generic', 'linux-base'] },
+      upgrades: { count: 104, status: 'available' },
+      disk: { availableBytes: 32 * 1024 * 1024 * 1024 },
+    },
+    service: { active: true, enabled: true, name: 'codex-web.service' },
+    storage: {
+      stateDir: { writable: true, path: '/root/.codex-web' },
+      reportsDir: { writable: true, path: '/root/.codex-web/reports' },
+    },
+    backup: { latest: { name: '20260610-010203' } },
+    provider: { status: 'provider_ok', usage: { status: 'unavailable', required: false } },
+    versions: { node: 'v24.0.0', npm: '10.9.2', codex: 'codex-cli 0.42.0' },
+  };
+
+  const html = api.renderSettings(false);
+
+  assert.match(html, /系统需重启/u);
+  assert.match(html, /104 个包可升级/u);
+  assert.match(html, /codex-web\.service/u);
+  assert.match(html, /最近备份/u);
+  assert.match(html, /官方用量不可用，不影响第三方 API/u);
+  assert.doesNotMatch(html, /角色/u);
+  assert.doesNotMatch(html, /用户/u);
+  assert.ok(html.length < 90_000, `settings markup should stay bounded, got ${html.length} bytes`);
 });
 
 test('page resume waits for form focus before refreshing the session', async () => {

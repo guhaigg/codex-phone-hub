@@ -74,6 +74,8 @@ const state = {
   adminSaving: false,
   runtimeHealth: null,
   runtimeHealthLoading: false,
+  diagnostics: null,
+  diagnosticsLoading: false,
   model: "",
   view: "sessions",
   isMobile: window.innerWidth < 820,
@@ -1216,10 +1218,12 @@ function renderSettings(mobile) {
         <section class="open-section">
           <div class="section-kicker">维护</div>
           ${settingStatic("Provider", runtimeHealthText(), runtimeHealthIcon())}
+          ${renderDiagnosticsSummary()}
           ${settingStatic("用量", usageText(), "info")}
           ${settingStatic("版本", `Build ${APP_BUILD_ID}`, "code")}
           <div class="action-line">
             <button class="ghost-action" type="button" id="refresh-runtime-health">${state.runtimeHealthLoading ? "刷新中..." : "刷新状态"}</button>
+            <button class="ghost-action" type="button" id="refresh-diagnostics">${state.diagnosticsLoading ? "检查中..." : "系统诊断"}</button>
             <button class="ghost-action" type="button" id="refresh-usage">刷新用量</button>
             <button class="ghost-action" type="button" id="reload-runtime">重载运行时</button>
             <button class="ghost-action danger" type="button" id="clear-cache">清理缓存</button>
@@ -1232,6 +1236,24 @@ function renderSettings(mobile) {
       </form>
     </section>
   `;
+}
+
+function renderDiagnosticsSummary() {
+  const diagnostics = state.diagnostics;
+  if (!diagnostics) {
+    return settingStatic(
+      "系统",
+      state.diagnosticsLoading ? "检查中" : "按需检查重启、升级包、磁盘、服务和备份",
+      state.diagnosticsLoading ? "refresh" : "info",
+    );
+  }
+  return [
+    settingStatic("系统", systemDiagnosticsText(diagnostics), systemDiagnosticsIcon(diagnostics)),
+    settingStatic("服务", serviceDiagnosticsText(diagnostics), diagnostics.service?.active === true ? "check" : "info"),
+    settingStatic("存储", storageDiagnosticsText(diagnostics), storageDiagnosticsIcon(diagnostics)),
+    settingStatic("最近备份", backupDiagnosticsText(diagnostics), diagnostics.backup?.latest ? "doc" : "info"),
+    settingStatic("第三方 API", diagnosticsProviderText(diagnostics), "refresh"),
+  ].join("");
 }
 
 function settingStatic(title, desc, iconName) {
@@ -1810,6 +1832,7 @@ function bindApp(root = document) {
   }
   qs("#refresh-usage")?.addEventListener("click", () => refreshUsage());
   qs("#refresh-runtime-health")?.addEventListener("click", () => refreshRuntimeHealth());
+  qs("#refresh-diagnostics")?.addEventListener("click", () => refreshDiagnostics());
   qs("#reload-runtime")?.addEventListener("click", reloadRuntime);
   qs("#logout-button")?.addEventListener("click", logout);
   qs("#clear-cache")?.addEventListener("click", clearLocalCache);
@@ -2080,6 +2103,7 @@ async function setView(view) {
     await Promise.all([
       refreshModels().catch(() => null),
       refreshRuntimeHealth({ silent: true }).catch(() => null),
+      refreshDiagnostics({ silent: true }).catch(() => null),
     ]);
     renderAfterBackgroundRefresh();
   }
@@ -2138,6 +2162,32 @@ async function refreshRuntimeHealth({ silent = false } = {}) {
     if (!silent) state.notice = state.runtimeHealth.message;
   } finally {
     state.runtimeHealthLoading = false;
+    if (!silent) render();
+  }
+}
+
+async function refreshDiagnostics({ silent = false } = {}) {
+  state.diagnosticsLoading = true;
+  if (!silent) {
+    state.notice = "正在检查系统状态";
+    render();
+  }
+  try {
+    const payload = await apiFetch("/api/diagnostics/summary");
+    state.diagnostics = payload?.summary || null;
+    if (!silent) state.notice = "系统诊断已刷新";
+  } catch (error) {
+    state.diagnostics = {
+      system: { reboot: { required: false, packages: [] }, upgrades: { count: null, status: "unknown" } },
+      service: { active: null, enabled: null, name: "codex-web.service" },
+      storage: {},
+      backup: { latest: null },
+      provider: { status: "failed", usage: { status: "unavailable", required: false } },
+      error: error?.payload?.message || error?.message || "系统诊断读取失败",
+    };
+    if (!silent) state.notice = state.diagnostics.error;
+  } finally {
+    state.diagnosticsLoading = false;
     if (!silent) render();
   }
 }
@@ -4244,6 +4294,65 @@ function runtimeHealthIcon() {
   if (status === "provider_ok") return "check";
   if (status === "auth_missing" || status === "failed") return "info";
   return "refresh";
+}
+
+function systemDiagnosticsText(diagnostics) {
+  const parts = [];
+  if (diagnostics.system?.reboot?.required) {
+    const packages = diagnostics.system.reboot.packages || [];
+    parts.push(`系统需重启${packages.length ? ` · ${packages.slice(0, 2).join(", ")}` : ""}`);
+  } else {
+    parts.push("无需系统重启");
+  }
+  const upgradeCount = diagnostics.system?.upgrades?.count;
+  if (typeof upgradeCount === "number") {
+    parts.push(`${upgradeCount} 个包可升级`);
+  } else {
+    parts.push("升级包数量未知");
+  }
+  const availableBytes = diagnostics.system?.disk?.availableBytes;
+  if (typeof availableBytes === "number") parts.push(`磁盘可用 ${formatBytes(availableBytes)}`);
+  return parts.join(" · ");
+}
+
+function systemDiagnosticsIcon(diagnostics) {
+  return diagnostics.system?.reboot?.required || Number(diagnostics.system?.upgrades?.count || 0) > 0 ? "info" : "check";
+}
+
+function serviceDiagnosticsText(diagnostics) {
+  const service = diagnostics.service || {};
+  const active = service.active === true ? "运行中" : service.active === false ? "未运行" : "未知";
+  const enabled = service.enabled === true ? "开机自启" : service.enabled === false ? "未自启" : "自启未知";
+  return `${service.name || "codex-web.service"} · ${active} · ${enabled}`;
+}
+
+function storageDiagnosticsText(diagnostics) {
+  const stateDir = diagnostics.storage?.stateDir || {};
+  const reportsDir = diagnostics.storage?.reportsDir || {};
+  const stateText = stateDir.writable === true ? "状态目录可写" : stateDir.exists === false ? "状态目录缺失" : "状态目录待确认";
+  const reportText = reportsDir.writable === true ? "报告目录可写" : reportsDir.exists === false ? "报告目录缺失" : "报告目录待确认";
+  return `${stateText} · ${reportText}`;
+}
+
+function storageDiagnosticsIcon(diagnostics) {
+  return diagnostics.storage?.stateDir?.writable === true && diagnostics.storage?.reportsDir?.writable === true ? "check" : "info";
+}
+
+function backupDiagnosticsText(diagnostics) {
+  const latest = diagnostics.backup?.latest;
+  if (latest?.name) return latest.name;
+  return diagnostics.backup?.exists === false ? "还没有备份目录" : "还没有备份记录";
+}
+
+function diagnosticsProviderText(diagnostics) {
+  const status = diagnostics.provider?.status === "provider_ok" ? "Provider OK" : "Provider 待确认";
+  const usageStatus = diagnostics.provider?.usage?.status;
+  const usage = usageStatus === "available"
+    ? "官方用量可读"
+    : usageStatus === "unavailable" || usageStatus === "unsupported"
+      ? "官方用量不可用，不影响第三方 API"
+      : "用量待确认";
+  return `${status} · ${usage}`;
 }
 
 function formatBytes(value) {

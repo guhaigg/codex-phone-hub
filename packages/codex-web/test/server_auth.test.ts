@@ -441,6 +441,41 @@ test('GET /api/runtime/health treats usage failures as non-blocking provider hea
   }
 });
 
+test('GET /api/diagnostics/summary returns authenticated production diagnostics', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-diagnostics-route-'));
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      listModels: async () => [{ id: 'third-party-model', name: 'Third Party' }],
+      readUsage: async () => {
+        throw new Error('official usage endpoint unavailable');
+      },
+      getActiveTurnCount: () => 1,
+    } as any,
+    config: createConfig({ stateDir, reportsDir: path.join(stateDir, 'reports') }),
+  });
+  await server.start();
+  try {
+    const unauthorized = await fetch(`${server.baseUrl}/api/diagnostics/summary`);
+    assert.equal(unauthorized.status, 401);
+
+    const response = await fetch(`${server.baseUrl}/api/diagnostics/summary`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json() as any;
+    assert.equal(payload.summary.auth.configured, true);
+    assert.equal(payload.summary.provider.status, 'provider_ok');
+    assert.equal(payload.summary.provider.usage.required, false);
+    assert.equal(payload.summary.runtime.activeTurnCount, 1);
+    assert.equal(payload.summary.storage.stateDir.path, stateDir);
+  } finally {
+    await server.stop();
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('POST /api/sessions/:sessionId/terminal starts a scoped command and streams output', async () => {
   const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-terminal-route-'));
   const server = createCodexWebServer({
