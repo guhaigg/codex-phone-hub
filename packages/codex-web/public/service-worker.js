@@ -1,10 +1,11 @@
-const STATIC_CACHE = 'codex-web-static-role-grants-20260609-1135';
+const ASSET_VERSION = '20260609-render-stability-fix1';
+const STATIC_CACHE = `codex-web-static-${ASSET_VERSION}`;
 const STATIC_ASSETS = [
   '/',
   '/index.html',
-  '/styles.css',
-  '/pwa-pull-refresh.js',
-  '/app.js',
+  `/styles.css?v=${ASSET_VERSION}`,
+  `/pwa-pull-refresh.js?v=${ASSET_VERSION}`,
+  `/app.js?v=${ASSET_VERSION}`,
   '/manifest.webmanifest',
   '/icon-192.png',
   '/icon-512.png',

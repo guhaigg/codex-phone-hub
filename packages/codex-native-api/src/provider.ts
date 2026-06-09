@@ -493,6 +493,13 @@ export interface ProviderPluginContract {
     onTurnStarted?: ((meta: Record<string, unknown>) => Promise<void> | void) | null;
     onApprovalRequest?: ((request: ProviderApprovalRequest) => Promise<void> | void) | null;
   }): Promise<ProviderTurnResult>;
+  steerTurn?(params: {
+    providerProfile: ProviderProfile;
+    threadId: string;
+    turnId: string;
+    event: ProviderTurnEvent;
+    inputText: string;
+  }): Promise<void>;
   startReview?(params: {
     providerProfile: ProviderProfile;
     bridgeSession?: ProviderTurnSession | null;

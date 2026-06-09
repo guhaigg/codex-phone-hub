@@ -13,6 +13,7 @@ import type {
   ProviderUsageReport,
 } from '../../codex-native-api/src/index.js';
 import { CodexWebEventBus } from '../src/event_bus.js';
+import { FileActiveTurnStore } from '../src/active_turn_store.js';
 import { CodexWebRuntime, type CodexWebRuntimeClient } from '../src/runtime.js';
 import { FileSessionTimelineStore } from '../src/session_timeline_store.js';
 
@@ -1582,6 +1583,127 @@ test('runtime handles help slash command without starting a native turn', async 
   assert.equal(startTurnCalls, 0);
 });
 
+test('runtime handles status, model, and permissions remote commands without starting a native turn', async () => {
+  let startTurnCalls = 0;
+  const client: CodexWebRuntimeClient = {
+    listModels: async () => [{ id: 'gpt-5.5', name: 'gpt-5.5' } as ProviderModelInfo],
+    readUsage: async (): Promise<ProviderUsageReport | null> => ({ planType: 'third-party', raw: {} } as ProviderUsageReport),
+    listThreads: async () => ({ items: [createThread('thread_remote_commands')], nextCursor: null }),
+    startThread: async () => ({ threadId: 'thread_remote_commands', cwd: '/workspace', title: 'Thread' }),
+    readThread: async () => createThread('thread_remote_commands'),
+    getThreadGoal: async () => ({
+      threadId: 'thread_remote_commands',
+      objective: 'ship remote commands',
+      status: 'active',
+    }),
+    writeConfigValue: async () => {},
+    startTurn: async (): Promise<ProviderTurnResult> => {
+      startTurnCalls += 1;
+      return {
+        outputText: 'should not run',
+        status: 'completed',
+        turnId: 'turn_unexpected',
+        threadId: 'thread_remote_commands',
+      };
+    },
+    interruptTurn: async () => {},
+    respondToApproval: async () => {},
+  };
+
+  const runtime = new CodexWebRuntime({
+    codexBin: 'codex',
+    defaultCwd: '/workspace',
+    client,
+    eventBus: new CodexWebEventBus(),
+  });
+
+  const status = await runtime.startTurn('thread_remote_commands', { text: '/status' });
+  assert.equal(status.type, 'command');
+  assert.equal(status.command.name, 'status');
+  assert.match(status.command.message, /thread_remote_commands/u);
+  assert.match(status.command.message, /ship remote commands/u);
+  assert.match(status.command.message, /third-party|available|unavailable/u);
+
+  const model = await runtime.startTurn('thread_remote_commands', { text: '/model gpt-5.5' });
+  assert.equal(model.type, 'command');
+  assert.equal(model.command.name, 'model');
+  assert.match(model.command.message, /gpt-5\.5/u);
+  assert.equal(model.session?.settings.model, 'gpt-5.5');
+
+  const permissions = await runtime.startTurn('thread_remote_commands', { text: '/permissions read-only' });
+  assert.equal(permissions.type, 'command');
+  assert.equal(permissions.command.name, 'permissions');
+  assert.match(permissions.command.message, /read-only/u);
+  assert.equal(permissions.session?.settings.accessPreset, 'read-only');
+
+  const unknown = await runtime.startTurn('thread_remote_commands', { text: '/does-not-exist' });
+  assert.equal(unknown.type, 'command');
+  assert.equal(unknown.command.name, 'unknown');
+  assert.match(unknown.command.message, /不支持/u);
+
+  assert.equal(startTurnCalls, 0);
+});
+
+test('runtime handles plan, resume, and ecosystem remote commands without starting a native turn', async () => {
+  let startTurnCalls = 0;
+  const resumeThreadCalls: string[] = [];
+  const client: CodexWebRuntimeClient = {
+    listModels: async () => [],
+    readUsage: async (): Promise<ProviderUsageReport | null> => null,
+    listThreads: async () => ({ items: [createThread('thread_remote_commands')], nextCursor: null }),
+    startThread: async () => ({ threadId: 'thread_remote_commands', cwd: '/workspace', title: 'Thread' }),
+    readThread: async (threadId: string) => createThread(threadId),
+    resumeThread: async ({ threadId }) => {
+      resumeThreadCalls.push(threadId);
+    },
+    writeConfigValue: async () => {},
+    startTurn: async (): Promise<ProviderTurnResult> => {
+      startTurnCalls += 1;
+      return {
+        outputText: 'should not run',
+        status: 'completed',
+        turnId: 'turn_unexpected',
+        threadId: 'thread_remote_commands',
+      };
+    },
+    interruptTurn: async () => {},
+    respondToApproval: async () => {},
+  };
+
+  const runtime = new CodexWebRuntime({
+    codexBin: 'codex',
+    defaultCwd: '/workspace',
+    client,
+    eventBus: new CodexWebEventBus(),
+  });
+
+  const plan = await runtime.startTurn('thread_remote_commands', { text: '/plan Build workspace inspector' });
+  assert.equal(plan.type, 'command');
+  assert.equal(plan.command.name, 'plan');
+  assert.equal(plan.command.draftPrompt, 'Build workspace inspector');
+  assert.equal(plan.session?.settings.collaborationMode, 'plan');
+
+  const resumed = await runtime.startTurn('thread_remote_commands', { text: '/resume thread_existing' });
+  assert.equal(resumed.type, 'command');
+  assert.equal(resumed.command.name, 'resume');
+  assert.equal(resumed.session?.id, 'thread_existing');
+  assert.equal(resumeThreadCalls.includes('thread_existing'), true);
+
+  const fork = await runtime.startTurn('thread_remote_commands', { text: '/fork thread_existing' });
+  assert.equal(fork.type, 'command');
+  assert.equal(fork.command.name, 'fork');
+  assert.equal(fork.command.action, 'unsupported');
+
+  for (const text of ['/mcp', '/skills', '/plugins']) {
+    const result = await runtime.startTurn('thread_remote_commands', { text });
+    assert.equal(result.type, 'command');
+    assert.equal(result.command.name, text.slice(1));
+    assert.match(result.command.message, /摘要接口/u);
+  }
+
+  assert.equal(startTurnCalls, 0);
+});
+
 test('runtime readSession exposes backend-managed slash command timeline entries', async () => {
   const timelinePath = `/tmp/codex-web-runtime-timeline-${process.pid}-${Date.now()}.json`;
   const client: CodexWebRuntimeClient = {
@@ -1773,6 +1895,179 @@ test('runtime readSession exposes only process-active turn state', async () => {
   assert.equal((await runtime.readSession('thread_active_state'))?.activeTurnId, null);
 });
 
+test('runtime persists active turn records and clears them after terminal results', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-web-runtime-active-turns-'));
+  try {
+    let resolveTurn: ((result: ProviderTurnResult) => void) | null = null;
+    const activeTurnStore = new FileActiveTurnStore({ activeTurnsPath: path.join(dir, 'active-turns.json') });
+    const client: CodexWebRuntimeClient = {
+      listModels: async () => [],
+      readUsage: async (): Promise<ProviderUsageReport | null> => null,
+      listThreads: async () => ({ items: [createThread('thread_persist')], nextCursor: null }),
+      startThread: async () => ({ threadId: 'thread_persist', cwd: '/workspace', title: 'Thread' }),
+      readThread: async () => createThread('thread_persist'),
+      writeConfigValue: async () => {},
+      startTurn: async ({ onTurnStarted }): Promise<ProviderTurnResult> => {
+        await onTurnStarted?.({ turnId: 'turn_persist', threadId: 'thread_persist' });
+        return new Promise<ProviderTurnResult>((resolve) => {
+          resolveTurn = resolve;
+        });
+      },
+      interruptTurn: async () => {},
+      respondToApproval: async () => {},
+    };
+    const runtime = new CodexWebRuntime({
+      codexBin: 'codex',
+      defaultCwd: '/workspace',
+      client,
+      eventBus: new CodexWebEventBus(),
+      activeTurnStore,
+    });
+
+    assert.deepEqual(await runtime.startTurn('thread_persist', { text: 'hi' }), { turnId: 'turn_persist' });
+    assert.deepEqual(activeTurnStore.get('turn_persist'), {
+      turnId: 'turn_persist',
+      threadId: 'thread_persist',
+      startedAt: activeTurnStore.get('turn_persist')?.startedAt,
+      lastEventSequence: 1,
+      lastKnownStatus: 'running',
+      pendingApprovalIds: [],
+    });
+
+    resolveTurn?.({
+      outputText: 'done',
+      status: 'completed',
+      turnId: 'turn_persist',
+      threadId: 'thread_persist',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(activeTurnStore.get('turn_persist'), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runtime reload exposes durable active turns as recoverable and clears terminal history', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-web-runtime-active-turns-'));
+  try {
+    const activeTurnStore = new FileActiveTurnStore({ activeTurnsPath: path.join(dir, 'active-turns.json') });
+    activeTurnStore.upsert({
+      turnId: 'turn_recoverable',
+      threadId: 'thread_recoverable',
+      startedAt: 100,
+      lastEventSequence: 9,
+      lastKnownStatus: 'running',
+      pendingApprovalIds: [],
+    });
+    activeTurnStore.upsert({
+      turnId: 'turn_terminal',
+      threadId: 'thread_terminal',
+      startedAt: 101,
+      lastEventSequence: 10,
+      lastKnownStatus: 'running',
+      pendingApprovalIds: [],
+    });
+    const client: CodexWebRuntimeClient = {
+      listModels: async () => [],
+      readUsage: async (): Promise<ProviderUsageReport | null> => null,
+      listThreads: async () => ({ items: [createThread('thread_recoverable'), createThread('thread_terminal')], nextCursor: null }),
+      startThread: async () => ({ threadId: 'thread_recoverable', cwd: '/workspace', title: 'Thread' }),
+      readThread: async (threadId) => ({
+        ...createThread(threadId),
+        turns: threadId === 'thread_terminal'
+          ? [{ id: 'turn_terminal', status: 'completed', error: null, items: [] }]
+          : [],
+      }),
+      writeConfigValue: async () => {},
+      startTurn: async () => ({
+        outputText: 'done',
+        status: 'completed',
+        turnId: 'turn_new',
+        threadId: 'thread_recoverable',
+      }),
+      interruptTurn: async () => {},
+      respondToApproval: async () => {},
+    };
+    const runtime = new CodexWebRuntime({
+      codexBin: 'codex',
+      defaultCwd: '/workspace',
+      client,
+      eventBus: new CodexWebEventBus(),
+      activeTurnStore,
+    });
+
+    const recoverable = await runtime.readSession('thread_recoverable');
+    assert.equal(recoverable?.activeTurnId, 'turn_recoverable');
+    assert.equal(recoverable?.activeTurnRecoverable, true);
+    assert.equal(recoverable?.lastKnownTurnStatus, 'running');
+    assert.equal(runtime.hasActiveTurn('turn_recoverable'), false);
+
+    const terminal = await runtime.readSession('thread_terminal');
+    assert.equal(terminal?.activeTurnId, null);
+    assert.equal(terminal?.activeTurnRecoverable, false);
+    assert.equal(activeTurnStore.get('turn_terminal'), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runtime resolves durable turn and approval ownership after process restart', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-web-runtime-active-turns-'));
+  try {
+    const calls: string[] = [];
+    const activeTurnStore = new FileActiveTurnStore({ activeTurnsPath: path.join(dir, 'active-turns.json') });
+    activeTurnStore.upsert({
+      turnId: 'turn_durable',
+      threadId: 'thread_durable',
+      startedAt: 100,
+      lastEventSequence: 3,
+      lastKnownStatus: 'approval_pending',
+      pendingApprovalIds: ['approval_durable'],
+    });
+    const client: CodexWebRuntimeClient = {
+      listModels: async () => [],
+      readUsage: async (): Promise<ProviderUsageReport | null> => null,
+      listThreads: async () => ({ items: [createThread('thread_durable')], nextCursor: null }),
+      startThread: async () => ({ threadId: 'thread_durable', cwd: '/workspace', title: 'Thread' }),
+      readThread: async () => createThread('thread_durable'),
+      writeConfigValue: async () => {},
+      startTurn: async () => ({
+        outputText: 'done',
+        status: 'completed',
+        turnId: 'turn_new',
+        threadId: 'thread_durable',
+      }),
+      interruptTurn: async ({ threadId, turnId }) => {
+        calls.push(`interrupt:${threadId}:${turnId}`);
+      },
+      respondToApproval: async ({ requestId, option }) => {
+        calls.push(`approval:${requestId}:${option}`);
+      },
+    };
+    const runtime = new CodexWebRuntime({
+      codexBin: 'codex',
+      defaultCwd: '/workspace',
+      client,
+      eventBus: new CodexWebEventBus(),
+      activeTurnStore,
+    });
+
+    assert.equal(runtime.threadIdForTurn('turn_durable'), 'thread_durable');
+    assert.equal(runtime.threadIdForApproval('approval_durable'), 'thread_durable');
+    await runtime.interruptTurn('turn_durable');
+    await runtime.resolveApproval('approval_durable', 'accept');
+
+    assert.deepEqual(calls, [
+      'interrupt:thread_durable:turn_durable',
+      'approval:approval_durable:1',
+    ]);
+    assert.deepEqual(activeTurnStore.get('turn_durable')?.pendingApprovalIds, []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('runtime ignores stale historical active turns when starting a new non-command turn', async () => {
   let startTurnCalls = 0;
   const client: CodexWebRuntimeClient = {
@@ -1888,6 +2183,89 @@ test('runtime rejects overlapping non-command turns that are active in this proc
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(startTurnCalls, 1);
+});
+
+test('runtime steers an active turn through the native client without starting a second turn', async () => {
+  let resolveTurn: ((result: ProviderTurnResult) => void) | null = null;
+  let startTurnCalls = 0;
+  const steerCalls: any[] = [];
+  const client: CodexWebRuntimeClient = {
+    listModels: async () => [],
+    readUsage: async (): Promise<ProviderUsageReport | null> => null,
+    listThreads: async () => ({ items: [createThread('thread_steer')], nextCursor: null }),
+    startThread: async () => ({ threadId: 'thread_steer', cwd: '/workspace', title: 'Thread' }),
+    readThread: async () => createThread('thread_steer'),
+    writeConfigValue: async () => {},
+    startTurn: async ({ onTurnStarted }): Promise<ProviderTurnResult> => {
+      startTurnCalls += 1;
+      await onTurnStarted?.({ turnId: 'turn_steer', threadId: 'thread_steer' });
+      return new Promise<ProviderTurnResult>((resolve) => {
+        resolveTurn = resolve;
+      });
+    },
+    steerTurn: async (args: any) => {
+      steerCalls.push(args);
+    },
+    interruptTurn: async () => {},
+    respondToApproval: async () => {},
+  };
+  const runtime = new CodexWebRuntime({
+    codexBin: 'codex',
+    defaultCwd: '/workspace',
+    client,
+    eventBus: new CodexWebEventBus(),
+  });
+
+  await runtime.startTurn('thread_steer', { text: 'first' });
+  await runtime.steerTurn('turn_steer', { text: 'Please refine the tests' });
+
+  assert.equal(startTurnCalls, 1);
+  assert.deepEqual(steerCalls, [{
+    threadId: 'thread_steer',
+    turnId: 'turn_steer',
+    inputText: 'Please refine the tests',
+    input: null,
+  }]);
+
+  resolveTurn?.({
+    outputText: 'done',
+    status: 'completed',
+    turnId: 'turn_steer',
+    threadId: 'thread_steer',
+  });
+});
+
+test('runtime returns steer_not_supported when the native client cannot steer turns', async () => {
+  const client: CodexWebRuntimeClient = {
+    listModels: async () => [],
+    readUsage: async (): Promise<ProviderUsageReport | null> => null,
+    listThreads: async () => ({ items: [createThread('thread_no_steer')], nextCursor: null }),
+    startThread: async () => ({ threadId: 'thread_no_steer', cwd: '/workspace', title: 'Thread' }),
+    readThread: async () => createThread('thread_no_steer'),
+    writeConfigValue: async () => {},
+    startTurn: async ({ onTurnStarted }): Promise<ProviderTurnResult> => {
+      await onTurnStarted?.({ turnId: 'turn_no_steer', threadId: 'thread_no_steer' });
+      return new Promise<ProviderTurnResult>(() => {});
+    },
+    interruptTurn: async () => {},
+    respondToApproval: async () => {},
+  };
+  const runtime = new CodexWebRuntime({
+    codexBin: 'codex',
+    defaultCwd: '/workspace',
+    client,
+    eventBus: new CodexWebEventBus(),
+  });
+
+  await runtime.startTurn('thread_no_steer', { text: 'first' });
+  await assert.rejects(
+    runtime.steerTurn('turn_no_steer', { text: 'continue' }),
+    (error: unknown) => {
+      assert.equal((error as Error & { code?: string }).code, 'steer_not_supported');
+      assert.match((error as Error).message, /does not support steering/u);
+      return true;
+    },
+  );
 });
 
 test('runtime still allows slash commands while thread history shows an active turn', async () => {

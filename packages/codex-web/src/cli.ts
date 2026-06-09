@@ -6,6 +6,7 @@ import readline from 'node:readline/promises';
 import { stdin as defaultStdin, stdout as defaultStdout, stderr as defaultStderr } from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { AuthStore, type PublicAuthSession } from './auth_store.js';
+import { FileActiveTurnStore } from './active_turn_store.js';
 import { loadServiceConfig, type CodexWebConfig } from './config.js';
 import { HybridAuthStore } from './hybrid_auth_store.js';
 import { FileIdentityStore } from './identity_store.js';
@@ -220,6 +221,9 @@ export async function startServeCommand(
     }),
     timelineStore: new FileSessionTimelineStore({
       timelinePath: path.join(runtimeConfig.stateDir, 'session-timeline.json'),
+    }),
+    activeTurnStore: new FileActiveTurnStore({
+      activeTurnsPath: path.join(runtimeConfig.stateDir, 'active-turns.json'),
     }),
   }));
   const runtime = createRuntimeFn({ config });

@@ -724,6 +724,30 @@ export class CodexAppClient extends EventEmitter {
     await this.request('turn/interrupt', { threadId, turnId }, { timeoutMs: 15_000 });
   }
 
+  async steerTurn({
+    threadId,
+    turnId,
+    inputText,
+    input = null,
+  }: {
+    threadId: string;
+    turnId: string;
+    inputText: string;
+    input?: CodexTurnInput[] | null;
+  }): Promise<void> {
+    await this.request('turn/steer', {
+      threadId,
+      turnId,
+      input: Array.isArray(input) && input.length > 0
+        ? input
+        : [{
+          type: 'text',
+          text: inputText,
+          text_elements: [],
+        }],
+    }, { timeoutMs: 30_000 });
+  }
+
   getPendingApprovals({
     threadId = null,
     turnId = null,

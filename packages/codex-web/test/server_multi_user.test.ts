@@ -8,6 +8,7 @@ import { HybridAuthStore } from '../src/hybrid_auth_store.js';
 import { createCodexWebServer } from '../src/server.js';
 import { FileIdentityStore } from '../src/identity_store.js';
 import type { CodexWebPrincipal } from '../src/access_control.js';
+import { CodexWebWorkspaceEventBus } from '../src/workspace_event_bus.js';
 
 interface TestConfig {
   host: string;
@@ -316,6 +317,46 @@ test('multi-user read and write reject sessions owned by another user', async ()
   }
 });
 
+test('multi-user steer turn requires write access to the owning app session', async () => {
+  const identityStore = await createIdentityStore();
+  const steerCalls: string[] = [];
+  const runtime = {
+    ...runtimeStub(),
+    threadIdForTurn: (turnId: string) => turnId === 'turn_alice' ? 'thread_alice' : 'thread_bob',
+    steerTurn: async (turnId: string, input: any) => {
+      steerCalls.push(`${turnId}:${input.text}`);
+      return { ok: true };
+    },
+  };
+  const server = createCodexWebServer({
+    auth: authFor({
+      alice: { userId: 'user_alice', username: 'alice', roleIds: [], isAdmin: false, mode: 'multi' },
+    }),
+    identityStore,
+    runtime: runtime as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const allowed = await fetch(`${server.baseUrl}/api/turns/turn_alice/steer`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer alice', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'continue' }),
+    });
+    assert.equal(allowed.status, 202);
+
+    const denied = await fetch(`${server.baseUrl}/api/turns/turn_bob/steer`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer alice', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'not allowed' }),
+    });
+    assert.equal(denied.status, 404);
+    assert.deepEqual(steerCalls, ['turn_alice:continue']);
+  } finally {
+    await server.stop();
+  }
+});
+
 test('multi-user session create uses project cwd and stores app session mapping', async () => {
   const identityStore = await createIdentityStore();
   const runtime = runtimeStub();
@@ -344,6 +385,82 @@ test('multi-user session create uses project cwd and stores app session mapping'
     assert.equal(state.sessions.some((session) => session.codexThreadId === 'thread_new'), true);
   } finally {
     await server.stop();
+  }
+});
+
+test('multi-user project workspace status requires project read access', async () => {
+  const identityStore = await createIdentityStore();
+  const allowedDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-project-workspace-'));
+  await identityStore.upsertProject({
+    id: 'project_allowed',
+    internalName: 'secret-repo',
+    cwd: allowedDir,
+    displayName: 'Allowed Project',
+    enabled: true,
+  });
+  const runtime = runtimeStub();
+  const server = createCodexWebServer({
+    auth: authFor({
+      alice: { userId: 'user_alice', username: 'alice', roleIds: [], isAdmin: false, mode: 'multi' },
+    }),
+    identityStore,
+    runtime: runtime as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const allowed = await fetch(`${server.baseUrl}/api/projects/project_allowed/status`, {
+      headers: { Authorization: 'Bearer alice' },
+    });
+    assert.equal(allowed.status, 200);
+    assert.equal(((await allowed.json()) as any).status.cwd, allowedDir);
+
+    const denied = await fetch(`${server.baseUrl}/api/projects/project_denied/status`, {
+      headers: { Authorization: 'Bearer alice' },
+    });
+    assert.equal(denied.status, 404);
+  } finally {
+    await server.stop();
+    await fs.rm(allowedDir, { recursive: true, force: true });
+  }
+});
+
+test('multi-user session workspace status uses the mapped project cwd instead of leaking runtime cwd', async () => {
+  const identityStore = await createIdentityStore();
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-session-workspace-'));
+  await identityStore.upsertProject({
+    id: 'project_allowed',
+    internalName: 'secret-repo',
+    cwd: projectDir,
+    displayName: 'Allowed Project',
+    enabled: true,
+  });
+  const runtime = runtimeStub();
+  const server = createCodexWebServer({
+    auth: authFor({
+      alice: { userId: 'user_alice', username: 'alice', roleIds: [], isAdmin: false, mode: 'multi' },
+    }),
+    identityStore,
+    runtime: runtime as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/sessions/app_alice/workspace/status`, {
+      headers: { Authorization: 'Bearer alice' },
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json() as any;
+    assert.equal(payload.status.cwd, projectDir);
+    assert.notEqual(payload.status.cwd, '/secret/path');
+
+    const otherUser = await fetch(`${server.baseUrl}/api/sessions/app_bob/workspace/status`, {
+      headers: { Authorization: 'Bearer alice' },
+    });
+    assert.equal(otherUser.status, 404);
+  } finally {
+    await server.stop();
+    await fs.rm(projectDir, { recursive: true, force: true });
   }
 });
 
@@ -1039,6 +1156,112 @@ test('admin normal event stream access to another owner session is hidden', asyn
       headers: { Authorization: 'Bearer admin' },
     });
     assert.equal(response.status, 404);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('multi-user workspace event stream is filtered to readable owned sessions', async () => {
+  const identityStore = await createIdentityStore();
+  const workspaceEvents = new CodexWebWorkspaceEventBus();
+  workspaceEvents.append({
+    type: 'turn.started',
+    sessionId: 'app_alice',
+    threadId: 'thread_alice',
+    turnId: 'turn_alice',
+    projectId: 'project_allowed',
+    ownerUserId: 'user_alice',
+  });
+  workspaceEvents.append({
+    type: 'turn.started',
+    sessionId: 'app_bob',
+    threadId: 'thread_bob',
+    turnId: 'turn_bob',
+    projectId: 'project_allowed',
+    ownerUserId: 'user_bob',
+  });
+  const server = createCodexWebServer({
+    auth: authFor({
+      alice: { userId: 'user_alice', username: 'alice', roleIds: ['role_user'], isAdmin: false, mode: 'multi' },
+    }),
+    identityStore,
+    runtime: runtimeStub() as any,
+    config: createConfig(),
+    workspaceEvents,
+  } as any);
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/workspace/events`, {
+      headers: { Authorization: 'Bearer alice' },
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body?.getReader();
+    assert.ok(reader);
+    const firstChunk = await reader!.read();
+    const text = new TextDecoder().decode(firstChunk.value);
+    assert.match(text, /turn_alice/u);
+    assert.doesNotMatch(text, /turn_bob/u);
+    await reader!.cancel();
+  } finally {
+    await server.stop();
+  }
+});
+
+test('multi-user turn events append workspace metadata for the app session owner', async () => {
+  const identityStore = await createIdentityStore();
+  const workspaceEvents = new CodexWebWorkspaceEventBus();
+  let turnListener: ((entry: any) => void) | null = null;
+  const runtime = {
+    ...runtimeStub(),
+    startTurn: async (threadId: string) => {
+      runtime.calls.push(`turn:${threadId}`);
+      return { turnId: 'turn_alice' };
+    },
+    subscribeToTurn: (_turnId: string, listener: (entry: any) => void) => {
+      turnListener = listener;
+      return () => {};
+    },
+  };
+  const server = createCodexWebServer({
+    auth: authFor({
+      alice: { userId: 'user_alice', username: 'alice', roleIds: [], isAdmin: false, mode: 'multi' },
+    }),
+    identityStore,
+    runtime: runtime as any,
+    config: createConfig(),
+    workspaceEvents,
+  } as any);
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/sessions/app_alice/turns`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer alice', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'continue' }),
+    });
+    assert.equal(response.status, 202);
+    assert.equal(typeof turnListener, 'function');
+    turnListener?.({
+      sequence: 9,
+      event: {
+        id: 'completed_1',
+        type: 'turn.completed',
+        turnId: 'turn_alice',
+        threadId: 'thread_alice',
+        status: 'completed',
+      },
+    });
+
+    const events = workspaceEvents.list().map((entry) => entry.event);
+    assert.deepEqual(events.map((event) => event.type), [
+      'turn.started',
+      'session.updated',
+      'turn.completed',
+      'session.updated',
+    ]);
+    assert.equal(events[0]?.sessionId, 'app_alice');
+    assert.equal(events[0]?.threadId, 'thread_alice');
+    assert.equal(events[0]?.projectId, 'project_allowed');
+    assert.equal(events[0]?.ownerUserId, 'user_alice');
   } finally {
     await server.stop();
   }

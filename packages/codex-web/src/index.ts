@@ -1,5 +1,11 @@
 export { AuthStore, type AuthSession, type AuthState, type PasswordHashRecord, type PublicAuthSession } from './auth_store.js';
 export {
+  FileActiveTurnStore,
+  type CodexWebActiveTurnRecord,
+  type CodexWebActiveTurnStore,
+  type CodexWebActiveTurnUpdate,
+} from './active_turn_store.js';
+export {
   canCreateProjectSession,
   canReadAppSession,
   canWriteAppSession,
@@ -13,6 +19,13 @@ export {
   type CodexWebEventListener,
   type CodexWebStoredEvent,
 } from './event_bus.js';
+export {
+  CodexWebWorkspaceEventBus,
+  type CodexWebStoredWorkspaceEvent,
+  type CodexWebWorkspaceEvent,
+  type CodexWebWorkspaceEventListener,
+  type CodexWebWorkspaceEventType,
+} from './workspace_event_bus.js';
 export {
   createBatchCompletedEvent,
   createBatchUpdatedEvent,

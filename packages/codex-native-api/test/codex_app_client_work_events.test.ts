@@ -6,8 +6,38 @@ import path from 'node:path';
 
 import {
   CodexAppClient,
+  type CodexTurnInput,
   type ProviderTurnWorkEvent,
 } from '../src/index.js';
+
+test('app client steers a running turn through the app-server turn/steer RPC', async () => {
+  const calls: Array<{ method: string; params: any }> = [];
+  const client = new CodexAppClient({
+    codexCliBin: 'codex',
+    turnPollSleep: async () => {},
+  });
+  client.request = async (method: string, params: any) => {
+    calls.push({ method, params });
+    return { ok: true };
+  };
+  const input: CodexTurnInput[] = [{ type: 'text', text: 'Refine the tests', text_elements: [] }];
+
+  await client.steerTurn({
+    threadId: 'thread_1',
+    turnId: 'turn_1',
+    inputText: 'Refine the tests',
+    input,
+  });
+
+  assert.deepEqual(calls, [{
+    method: 'turn/steer',
+    params: {
+      threadId: 'thread_1',
+      turnId: 'turn_1',
+      input,
+    },
+  }]);
+});
 
 test('app client extracts work details from function call notifications', async () => {
   const client = new CodexAppClient({

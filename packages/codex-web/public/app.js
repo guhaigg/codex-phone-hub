@@ -4,6 +4,13 @@ const THEME_KEY = "codexWebTheme";
 const SITE_TITLE_KEY = "codexWebSiteTitle";
 const DEFAULT_THREAD_SETTINGS_KEY = "codexWebDefaultThreadSettings";
 const DEFAULT_CWD_KEY = "codexWebDefaultCwd";
+const QUEUED_MESSAGES_KEY = "codexWebQueuedMessages";
+const SIDEBAR_RECENTS_LIMIT = 30;
+const SIDEBAR_SESSION_TITLE_LIMIT = 96;
+const SIDEBAR_SESSION_PREVIEW_LIMIT = 140;
+const TIMELINE_RENDER_LIMIT = 80;
+const TIMELINE_RENDER_STEP = 80;
+const TIMELINE_TEXT_LIMIT = 8000;
 
 const zh = {
   "Log in": "登录",
@@ -19,6 +26,7 @@ const zh = {
   "history": "历史",
   "preview": "预览",
   "sending": "发送中",
+  "steering": "追加指令",
   "streaming": "生成中",
   "final": "完成",
   "failed": "失败",
@@ -26,11 +34,12 @@ const zh = {
 
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || "",
-  siteTitle: normalizeSiteTitle(localStorage.getItem(SITE_TITLE_KEY) || "Codex"),
+  siteTitle: normalizeSiteTitle(localStorage.getItem(SITE_TITLE_KEY) || "Codex 远程工作台"),
   authSession: null,
   sessions: [],
   currentSession: null,
   sessionId: "",
+  draftSessionActive: false,
   timeline: [],
   models: [],
   reports: [],
@@ -58,6 +67,21 @@ const state = {
   turnId: "",
   streamAbortController: null,
   lastTurnEventSequence: null,
+  workspaceAbortController: null,
+  lastWorkspaceEventSequence: null,
+  workspaceReconnectTimer: null,
+  streamStartedAt: 0,
+  streamLastEventAt: 0,
+  streamWasBackgrounded: false,
+  timelineShouldFollowLatest: true,
+  timelineRenderLimit: TIMELINE_RENDER_LIMIT,
+  lastTimelineViewportSnapshot: null,
+  workspaceOpen: false,
+  workspaceLoading: false,
+  workspaceStatus: null,
+  workspaceDiff: null,
+  workspaceFile: null,
+  workspaceError: "",
   settingsOpen: false,
   sessionToolsOpen: false,
   search: "",
@@ -66,13 +90,30 @@ const state = {
   defaultThreadSettings: loadDefaultThreadSettings(),
   defaultCwd: localStorage.getItem(DEFAULT_CWD_KEY) || "",
   selectedFiles: [],
+  queuedMessages: loadQueuedMessages(),
   notice: "",
   settingsSaving: false,
 };
 
 const app = document.querySelector("#app");
 let lastFormControlInteractionAt = 0;
+let promptFocusLayoutTimer = null;
+let promptFocusRestoreTimer = null;
+let appVersionCheckInFlight = false;
+let workspaceEventsDeferredTimer = null;
+let workspaceEventsConnectAfterLoadAttached = false;
+const workspaceRefreshQueue = {
+  sessions: false,
+  currentSessionIds: new Set(),
+  reports: false,
+  scheduled: false,
+  promise: null,
+  resolve: null,
+};
 applyTheme(state.theme);
+setupServiceWorker();
+setupAppVersionRefresh();
+setupPwaPullToRefresh();
 boot();
 
 window.addEventListener("resize", () => {
@@ -84,13 +125,11 @@ window.addEventListener("resize", () => {
   }
 });
 
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && state.token) {
-    if (isFormControlInteractionActive()) return;
-    refreshSessions({ silent: true }).catch(() => null);
-    if (state.sessionId) refreshCurrentSession({ silent: true }).catch(() => null);
-  }
-});
+document.addEventListener('visibilitychange', onVisibilityChange);
+window.addEventListener('pageshow', onPageResume);
+window.addEventListener('focus', onPageResume);
+window.addEventListener('pagehide', () => stopWorkspaceEvents());
+window.addEventListener('beforeunload', () => stopWorkspaceEvents());
 
 document.addEventListener("focusin", (event) => {
   if (isFormControl(event.target)) markFormControlInteraction();
@@ -99,6 +138,80 @@ document.addEventListener("focusin", (event) => {
 document.addEventListener("pointerdown", (event) => {
   if (isFormControl(event.target)) markFormControlInteraction();
 }, true);
+
+function setupServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  if (isLocalPreviewHost()) {
+    window.addEventListener('load', () => {
+      void unregisterLocalPreviewServiceWorkers();
+    });
+    void unregisterLocalPreviewServiceWorkers();
+    return;
+  }
+  window.addEventListener('load', () => {
+    void navigator.serviceWorker.register('/service-worker.js');
+  });
+}
+
+function isLocalPreviewHost() {
+  const hostname = window.location?.hostname || "";
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+async function unregisterLocalPreviewServiceWorkers() {
+  try {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+  } catch (_error) {
+  }
+}
+
+function setupAppVersionRefresh() {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') void checkForAppUpdate();
+  });
+  window.addEventListener('pageshow', () => {
+    void checkForAppUpdate();
+  });
+}
+
+async function checkForAppUpdate() {
+  if (!APP_BUILD_ID || APP_BUILD_ID === "__CODEX_WEB_BUILD_ID__" || appVersionCheckInFlight) return;
+  appVersionCheckInFlight = true;
+  try {
+    const response = await fetch(`/app.js?version-check=${Date.now()}`, {
+      cache: "no-store",
+      headers: { Accept: "application/javascript" },
+    });
+    if (!response.ok) return;
+    const script = await response.text();
+    const match = script.match(/const APP_BUILD_ID = ["']([^"']+)["'];/u);
+    const nextBuildId = match?.[1] || "";
+    if (nextBuildId && nextBuildId !== "__CODEX_WEB_BUILD_ID__" && nextBuildId !== APP_BUILD_ID) {
+      window.location.reload();
+    }
+  } catch (_error) {
+  } finally {
+    appVersionCheckInFlight = false;
+  }
+}
+
+function isStandalonePwa() {
+  return navigator.standalone === true
+    || (typeof matchMedia === "function" && matchMedia('(display-mode: standalone)').matches === true);
+}
+
+function setupPwaPullToRefresh() {
+  if (!isStandalonePwa() || !window.CodexPullToRefresh?.init) return;
+  window.CodexPullToRefresh.init({
+    threshold: 120,
+    onRefresh: () => refreshCurrentView(),
+    getScrollContainer: ({ target } = {}) => {
+      const element = target?.closest?.('#timeline, #sidebar-recents, .mobile-page, .report-reader, .settings-page, .admin-page, .capabilities-page');
+      return element || document.scrollingElement || document.documentElement;
+    },
+  });
+}
 
 async function boot() {
   if (!state.token) {
@@ -119,6 +232,7 @@ async function restoreAuth() {
       refreshModels().catch(() => null),
       refreshSessions({ silent: true }).catch(() => null),
     ]);
+    scheduleWorkspaceEventsConnect();
     state.error = "";
   } catch (error) {
     handleApiError(error, { auth: true });
@@ -169,10 +283,12 @@ function handleApiError(error, options = {}) {
   }
   if (error?.status === 401 || options.auth) {
     stopStream();
+    stopWorkspaceEvents({ clearCursor: true });
     state.token = "";
     state.authSession = null;
     state.currentSession = null;
     state.sessionId = "";
+    state.draftSessionActive = false;
     localStorage.removeItem(TOKEN_KEY);
     state.loginError = options.login ? message : "登录已过期，请重新登录";
     render();
@@ -184,8 +300,9 @@ function handleApiError(error, options = {}) {
   render();
 }
 
-function render() {
+function render(options = {}) {
   if (!app) return;
+  const composerSnapshot = options.preserveComposer === false ? null : captureFocusedComposerState();
   if (!state.token) {
     app.innerHTML = renderLogin();
     bindLogin();
@@ -193,6 +310,7 @@ function render() {
   }
   app.innerHTML = state.isMobile ? renderMobileApp() : renderDesktopApp();
   bindApp();
+  restoreFocusedComposerState(composerSnapshot);
   requestAnimationFrame(scrollChatToBottom);
 }
 
@@ -202,7 +320,7 @@ function renderLogin() {
       <section class="login-brand">
         <div class="brand-orb">C</div>
         <h1>${escapeHtml(state.siteTitle)}</h1>
-        <p>新一代 AI 编程代理。在浏览器中高效管理和执行复杂编程任务。</p>
+        <p>在手机和浏览器中接管 Codex CLI 与桌面端会话。</p>
         <div class="login-pills">
           <span>会话持续运行</span>
           <span>移动端可用</span>
@@ -211,7 +329,7 @@ function renderLogin() {
       </section>
       <form class="login-card" id="login-form">
         <h2>欢迎使用</h2>
-        <p class="muted">登录以管理你的 AI 编程任务</p>
+        <p class="muted">登录后操作 Codex 远程会话</p>
         <label>
           <span>账号</span>
           <input name="username" autocomplete="username" placeholder="账号" value="">
@@ -224,7 +342,7 @@ function renderLogin() {
         <button class="primary" type="submit">${state.loading ? "登录中..." : "登录"}</button>
         <div class="login-foot">
           <label class="check-row"><input type="checkbox" checked> <span>保持登录</span></label>
-          <a href="#" tabindex="-1">忘记密码?</a>
+          <span>账号由服务器配置管理</span>
         </div>
       </form>
     </main>
@@ -262,12 +380,11 @@ function bindLogin() {
 
 function renderDesktopApp() {
   return `
-    <main class="desktop-shell">
-      <aside class="session-pane">
-        ${renderSessionHeader(false)}
-        ${renderSessionList()}
+    <main class="desktop-shell notebook-shell">
+      <aside class="session-pane notebook-sidebar">
+        ${renderNotebookSidebar()}
       </aside>
-      <section class="workspace-pane">
+      <section class="workspace-pane notebook-workspace">
         ${renderWorkspace(false)}
       </section>
     </main>
@@ -300,7 +417,7 @@ function renderSessionHeader(mobile) {
       <div class="title-row">
         <div>
           <h1>${escapeHtml(state.siteTitle)}</h1>
-          <p>${mobile ? "移动 AI 编程代理" : "会话与任务"}</p>
+          <p>${mobile ? "手机 Codex 工作台" : "会话与任务"}</p>
         </div>
         <button class="icon-btn" id="open-settings" title="设置">${icon("user")}</button>
       </div>
@@ -319,6 +436,81 @@ function renderSessionHeader(mobile) {
   `;
 }
 
+function renderNotebookSidebar() {
+  return `
+    <header class="sidebar-brand">
+      <h1>${escapeHtml(state.siteTitle)}</h1>
+      <button class="sidebar-collapse" type="button" id="open-settings" title="设置">${icon("panel")}</button>
+    </header>
+    <nav class="sidebar-nav" aria-label="主导航">
+      <button class="sidebar-nav-item" type="button" id="new-session-button">${icon("plus")}<span>新对话</span></button>
+      <label class="sidebar-nav-item sidebar-search">
+        ${icon("search")}
+        <input id="session-search" value="${escapeAttribute(state.search)}" placeholder="搜索">
+      </label>
+      ${sidebarNavButton("sessions", "对话", "message")}
+      ${sidebarNavButton("capabilities", "工作台", "grid")}
+      ${sidebarNavButton("reports", "报告", "clipboard")}
+      ${sidebarNavButton("admin", "管理", "layers")}
+      ${sidebarNavButton("settings", "设置", "settings")}
+    </nav>
+    <section class="sidebar-section">
+      <div class="sidebar-section-title">
+        <span>项目</span>
+      </div>
+      <div class="sidebar-project">${icon("folder")}<span>${escapeHtml(workspaceLabel())}</span></div>
+    </section>
+    <section class="sidebar-section sidebar-recents" id="sidebar-recents">
+      ${renderSidebarRecentsContent()}
+    </section>
+    ${renderSidebarAccount()}
+  `;
+}
+
+function renderSidebarRecentsContent() {
+  const sessions = filteredSessions();
+  return `
+    <div class="sidebar-section-title"><span>最近</span></div>
+    ${renderSessionList({
+      sessions,
+      limit: SIDEBAR_RECENTS_LIMIT,
+      compact: true,
+      moreLabel: state.search ? "" : "会话",
+    })}
+  `;
+}
+
+function sidebarNavButton(view, label, iconName) {
+  const active = state.view === view || (view === "sessions" && state.view === "chat");
+  return `
+    <button class="sidebar-nav-item ${active ? "active" : ""}" type="button" data-view="${escapeAttribute(view)}">
+      ${icon(iconName)}
+      <span>${escapeHtml(label)}</span>
+    </button>
+  `;
+}
+
+function renderSidebarAccount() {
+  const principal = state.authSession?.principal || {};
+  const name = principal.displayName || principal.username || principal.userId || "管理员";
+  const accountDetail = principal.email || principal.username || principal.userId || "本地账户";
+  return `
+    <footer class="sidebar-account">
+      <span class="account-avatar">${escapeHtml(initialForName(name))}</span>
+      <span class="account-copy">
+        <strong>${escapeHtml(name)}</strong>
+        <small>${escapeHtml(accountDetail)}</small>
+      </span>
+      <span class="sidebar-account-menu" aria-hidden="true">⌄</span>
+    </footer>
+  `;
+}
+
+function initialForName(name) {
+  const value = String(name || "").trim();
+  return value ? value.slice(0, 1).toUpperCase() : "C";
+}
+
 function renderViewTabs(mobile) {
   const items = mobile
     ? [["sessions", "会话"], ["capabilities", "能力"], ["reports", "报告"], ["settings", "设置"]]
@@ -332,54 +524,75 @@ function filterButton(mode, label) {
   return `<button class="chip ${state.sortMode === mode ? "active" : ""}" data-filter="${mode}">${escapeHtml(label)}</button>`;
 }
 
-function renderSessionList() {
+function renderSessionList(options = {}) {
   if (state.sessionsLoading) return `<div class="session-list">${Array.from({ length: 5 }).map(() => skeletonCard()).join("")}</div>`;
-  const sessions = filteredSessions();
+  const sessions = options.sessions || filteredSessions();
   if (!sessions.length) {
     return `
       <div class="empty-list">
         <div class="empty-plus">+</div>
         <h2>${state.search ? "没有匹配会话" : "还没有会话"}</h2>
-        <p>${state.search ? "换个关键词试试。" : "点击新建任务，开始第一段 Codex 会话。"}</p>
+        <p>${state.search ? "换个关键词试试。" : "使用顶部入口开始第一段 Codex 会话。"}</p>
       </div>
     `;
   }
-  return `<div class="session-list">${sessions.map(renderSessionCard).join("")}</div>`;
+  const limit = Number.isFinite(options.limit) ? Math.max(0, Number(options.limit)) : sessions.length;
+  const visible = sessions.slice(0, limit);
+  const hiddenCount = Math.max(0, sessions.length - visible.length);
+  const more = hiddenCount && options.moreLabel
+    ? `<div class="session-list-more">还有 ${hiddenCount} 个${escapeHtml(options.moreLabel)}</div>`
+    : "";
+  return `<div class="session-list">${visible.map((session) => renderSessionCard(session, { compact: options.compact === true })).join("")}${more}</div>`;
 }
 
-function renderSessionCard(session) {
+function renderSessionCard(session, options = {}) {
+  const compact = options.compact === true;
   const status = sessionStatus(session);
-  return `
-    <article class="session-card ${state.sessionId === session.id ? "active" : ""}" data-session-id="${escapeAttribute(session.id)}">
-      <button class="session-main" data-session-open="${escapeAttribute(session.id)}">
-        <span class="session-title">${escapeHtml(sessionTitle(session))}</span>
-        <span class="session-summary">${escapeHtml(sessionPreview(session))}</span>
-        <span class="session-meta">${icon("clock")} ${escapeHtml(formatTime(session.updatedAt || session.lastInputAt))}</span>
-      </button>
+  const title = compact
+    ? truncateText(sessionTitle(session), SIDEBAR_SESSION_TITLE_LIMIT)
+    : sessionTitle(session);
+  const preview = compact
+    ? truncateText(sessionPreview(session), SIDEBAR_SESSION_PREVIEW_LIMIT)
+    : sessionPreview(session);
+  const side = compact ? "" : `
       <div class="session-side">
         ${statusBadge(status)}
         <button class="mini-btn" data-favorite="${escapeAttribute(session.id)}" title="收藏">${isFavorite(session) ? "★" : "☆"}</button>
         <button class="mini-btn" data-archive="${escapeAttribute(session.id)}" title="${session.archived ? "取消归档" : "归档"}">•••</button>
       </div>
+  `;
+  return `
+    <article class="session-card ${compact ? "compact" : ""} ${state.sessionId === session.id ? "active" : ""}" data-session-id="${escapeAttribute(session.id)}">
+      <button class="session-main" data-session-open="${escapeAttribute(session.id)}">
+        <span class="session-title">${escapeHtml(title)}</span>
+        <span class="session-summary">${escapeHtml(preview)}</span>
+        <span class="session-meta">${icon("clock")} ${escapeHtml(formatTime(session.updatedAt || session.lastInputAt))}</span>
+      </button>
+      ${side}
     </article>
   `;
 }
 
 function renderChatOrEmpty(mobile) {
-  if (!state.currentSession && !state.sessionId && !state.prompt && !state.sessionToolsOpen) {
+  if (!state.currentSession && !state.sessionId && !state.prompt && !state.draftSessionActive && !state.sessionToolsOpen) {
     return `
-      <section class="chat-pane empty-chat">
+      <section class="chat-pane notebook-chat empty-chat">
         <div class="empty-hero">
           <div class="empty-plus">+</div>
           <h2>开始新的会话</h2>
-          <p>在左侧选择会话，或点击新建任务。</p>
-          <button class="primary" id="empty-new-session-button">新建任务</button>
+          <p>${mobile ? "在会话列表选择会话，或新建一段 Codex 会话。" : "在左侧侧边栏选择会话，或从侧边栏开始新的会话。"}</p>
+          ${mobile ? `<button class="primary" id="empty-new-session-button">新建任务</button>` : ""}
         </div>
       </section>
     `;
   }
+  const panelContent = [
+    state.notice ? `<div class="notice-line">${escapeHtml(state.notice)}</div>` : "",
+    state.sessionToolsOpen ? renderSessionTools() : "",
+    state.workspaceOpen ? renderWorkspaceInspector() : "",
+  ].filter(Boolean).join("");
   return `
-    <section class="chat-pane">
+    <section class="chat-pane notebook-chat">
       <header class="chat-head">
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div class="chat-title">
@@ -387,14 +600,14 @@ function renderChatOrEmpty(mobile) {
           <div>${statusBadge(currentStatus())}</div>
         </div>
         <button class="icon-btn" id="toggle-session-tools" title="能力">${icon("sliders")}</button>
+        <button class="icon-btn" id="toggle-workspace" title="工作区">${icon("folder")}</button>
         ${state.currentSession?.id ? `<button class="icon-btn" id="share-session" title="分享">${icon("share")}</button>` : ""}
         <button class="icon-btn" id="refresh-session" title="刷新">${icon("refresh")}</button>
       </header>
-      ${state.notice ? `<div class="notice-line">${escapeHtml(state.notice)}</div>` : ""}
-      ${state.sessionToolsOpen ? renderSessionTools() : ""}
-      <div class="messages" id="messages">
+      <div class="chat-panels">${panelContent}</div>
+      <main class="timeline chat-canvas" id="timeline">
         ${renderTimeline()}
-      </div>
+      </main>
       ${renderComposer()}
     </section>
   `;
@@ -409,7 +622,40 @@ function renderTimeline() {
       </div>
     `;
   }
-  return state.timeline.map(renderTimelineItem).join("");
+  const { items, hiddenCount } = visibleTimelineItems();
+  const historyNotice = hiddenCount ? renderTimelineHistoryNotice(hiddenCount) : "";
+  return `${historyNotice}${items.map(renderTimelineItem).join("")}`;
+}
+
+function visibleTimelineItems() {
+  const limit = Math.max(
+    TIMELINE_RENDER_LIMIT,
+    Number.isFinite(state.timelineRenderLimit) ? Number(state.timelineRenderLimit) : TIMELINE_RENDER_LIMIT,
+  );
+  const start = Math.max(0, state.timeline.length - limit);
+  return {
+    hiddenCount: start,
+    items: state.timeline.slice(start),
+  };
+}
+
+function renderTimelineHistoryNotice(hiddenCount) {
+  return `
+    <div class="timeline-history-note">
+      <span>较早 ${hiddenCount} 条已折叠</span>
+      <button type="button" id="show-more-timeline">加载更早记录</button>
+    </div>
+  `;
+}
+
+function resetTimelineRenderLimit() {
+  state.timelineRenderLimit = TIMELINE_RENDER_LIMIT;
+}
+
+function showMoreTimelineHistory() {
+  const current = Number.isFinite(state.timelineRenderLimit) ? Number(state.timelineRenderLimit) : TIMELINE_RENDER_LIMIT;
+  state.timelineRenderLimit = Math.min(state.timeline.length, current + TIMELINE_RENDER_STEP);
+  render();
 }
 
 function renderTimelineItem(item) {
@@ -417,7 +663,7 @@ function renderTimelineItem(item) {
     return `
       <article class="work-card">
         <div class="work-title">${escapeHtml(item.title || item.approvalKind || "工具调用")}</div>
-        <pre>${escapeHtml(formatSummary(item.summary || item.text || item.status || ""))}</pre>
+        <pre>${escapeHtml(truncateTimelineText(formatSummary(item.summary || item.text || item.status || "")))}</pre>
         ${item.kind === "approval" && item.approvalId ? renderApprovalActions(item.approvalId) : ""}
       </article>
     `;
@@ -425,11 +671,101 @@ function renderTimelineItem(item) {
   const role = item.role || "assistant";
   const isUser = role === "user";
   const isError = item.severity === "error";
+  const label = item.label || (isUser ? "你" : isError ? "错误" : "Codex");
   return `
     <article class="message ${isUser ? "user" : "assistant"} ${isError ? "error" : ""}">
-      <div class="message-label">${escapeHtml(isUser ? "你" : isError ? "错误" : "Codex")}${item.meta ? `<span>${escapeHtml(translate(item.meta))}</span>` : ""}</div>
-      <div class="message-body">${renderMessageText(item.text || "")}</div>
+      <div class="message-label">${escapeHtml(label)}${item.meta ? `<span>${escapeHtml(translate(item.meta))}</span>` : ""}</div>
+      <div class="message-body">${renderMessageText(truncateTimelineText(item.text || ""))}</div>
       ${isError ? `<button class="retry-btn" id="retry-last">重试</button>` : ""}
+    </article>
+  `;
+}
+
+function truncateTimelineText(value) {
+  const text = String(value || "");
+  if (text.length <= TIMELINE_TEXT_LIMIT) return text;
+  const hidden = text.length - TIMELINE_TEXT_LIMIT;
+  return `${text.slice(0, TIMELINE_TEXT_LIMIT).trimEnd()}\n\n[内容过长，已截断 ${hidden} 字]`;
+}
+
+function renderWorkspaceInspector() {
+  const status = state.workspaceStatus || {};
+  const counts = status.counts || {};
+  const files = Array.isArray(status.files) ? status.files : [];
+  return `
+    <section class="workspace-inspector">
+      <header>
+        <div>
+          <strong>工作区</strong>
+          <small>${escapeHtml(status.cwd || state.currentSession?.cwd || workspaceLabel())}</small>
+        </div>
+        <button type="button" class="mini-btn" id="refresh-workspace" title="刷新">${icon("refresh")}</button>
+      </header>
+      ${state.workspaceLoading ? `<div class="workspace-muted">正在读取工作区...</div>` : ""}
+      ${state.workspaceError ? `<div class="workspace-error">${escapeHtml(state.workspaceError)}</div>` : ""}
+      ${state.workspaceStatus ? `
+        <div class="workspace-status-line">
+          <span>${escapeHtml(status.isGitRepository ? (status.branch || "detached") : "非 Git 目录")}</span>
+          ${status.upstream ? `<span>${escapeHtml(status.upstream)}</span>` : ""}
+          <span>${status.diskWritable ? "可写" : "只读"}</span>
+          ${status.lastCommit?.shortHash ? `<span>${escapeHtml(status.lastCommit.shortHash)} ${escapeHtml(status.lastCommit.message || "")}</span>` : ""}
+        </div>
+        <div class="workspace-counts">
+          <span>已暂存 ${escapeHtml(counts.staged ?? 0)}</span>
+          <span>未暂存 ${escapeHtml(counts.unstaged ?? 0)}</span>
+          <span>未跟踪 ${escapeHtml(counts.untracked ?? 0)}</span>
+        </div>
+        <div class="workspace-layout">
+          <div class="workspace-files">
+            ${files.length ? files.map(renderWorkspaceFileButton).join("") : `<div class="workspace-muted">没有文件变更</div>`}
+          </div>
+          <div class="workspace-diff">
+            ${renderWorkspaceDiff()}
+          </div>
+        </div>
+        ${state.workspaceFile ? renderWorkspaceFilePreview() : ""}
+      ` : !state.workspaceLoading && !state.workspaceError ? `<div class="workspace-muted">打开后读取当前会话工作区状态。</div>` : ""}
+    </section>
+  `;
+}
+
+function renderWorkspaceFileButton(file) {
+  const badge = `${String(file.indexStatus || " ").trim() || "-"}${String(file.worktreeStatus || " ").trim() || "-"}`;
+  return `
+    <button type="button" data-workspace-file="${escapeAttribute(file.path || "")}">
+      <span>${escapeHtml(file.path || "")}</span>
+      <em>${escapeHtml(badge)}</em>
+    </button>
+  `;
+}
+
+function renderWorkspaceDiff() {
+  const diff = state.workspaceDiff || {};
+  const files = Array.isArray(diff.files) ? diff.files : [];
+  if (!files.length && !diff.raw) {
+    return `<div class="workspace-muted">没有 diff</div>`;
+  }
+  if (files.length) {
+    return files.map((file) => `
+      <article class="workspace-diff-file">
+        <strong>${escapeHtml(file.path || file.newPath || "")}</strong>
+        ${(Array.isArray(file.hunks) ? file.hunks : []).map((hunk) => `
+          <pre><code>${escapeHtml([hunk.header, ...(Array.isArray(hunk.lines) ? hunk.lines : [])].join("\n"))}</code></pre>
+        `).join("")}
+      </article>
+    `).join("");
+  }
+  return `<pre><code>${escapeHtml(truncateTimelineText(diff.raw || ""))}</code></pre>`;
+}
+
+function renderWorkspaceFilePreview() {
+  return `
+    <article class="workspace-file-preview">
+      <header>
+        <strong>${escapeHtml(state.workspaceFile.relativePath || "文件")}</strong>
+        <small>${escapeHtml(formatBytes(state.workspaceFile.sizeBytes || 0))}</small>
+      </header>
+      <pre><code>${escapeHtml(truncateTimelineText(state.workspaceFile.content || ""))}</code></pre>
     </article>
   `;
 }
@@ -449,33 +785,112 @@ function renderMessageText(text) {
   const value = String(text || "");
   if (!value.trim()) return "";
   const parts = value.split(/```/g);
-  if (parts.length === 1) return `<p>${linkify(escapeHtml(value)).replace(/\n/g, "<br>")}</p>`;
+  if (parts.length === 1) return `<p>${renderInlineMessageText(value).replace(/\n/g, "<br>")}</p>`;
   return parts.map((part, index) => {
-    if (index % 2 === 0) return `<p>${linkify(escapeHtml(part)).replace(/\n/g, "<br>")}</p>`;
+    if (index % 2 === 0) return `<p>${renderInlineMessageText(part).replace(/\n/g, "<br>")}</p>`;
     const lines = part.replace(/^\w+\n/u, "").trimEnd();
     return `<pre class="code-block"><code>${escapeHtml(lines)}</code></pre>`;
   }).join("");
 }
 
+function renderInlineMessageText(text) {
+  const value = String(text || "");
+  const linkPattern = /\[([^\]\n]+)\]\(([^)\s]+)\)/gu;
+  let html = "";
+  let cursor = 0;
+  for (const match of value.matchAll(linkPattern)) {
+    html += renderPlainInline(value.slice(cursor, match.index));
+    html += renderMessageLink(match[1], match[2]);
+    cursor = match.index + match[0].length;
+  }
+  html += renderPlainInline(value.slice(cursor));
+  return html;
+}
+
+function renderPlainInline(text) {
+  return linkReportPaths(linkify(escapeHtml(text)))
+    .replace(/`([^`<]+)`/gu, "<code>$1</code>");
+}
+
+function renderMessageLink(label, href) {
+  if (isReportPath(href)) {
+    return reportPathLink(href, label);
+  }
+  if (/^https?:\/\//u.test(href)) {
+    return `<a href="${escapeAttribute(href)}" target="_blank" rel="noreferrer">${renderPlainInline(label)}</a>`;
+  }
+  return renderPlainInline(`[${label}](${href})`);
+}
+
+function linkReportPaths(html) {
+  return String(html || "").replace(/\/[^\s<>()"']*\/\.codex-web\/reports\/[^\s<>()"']+\.md/gu, (path) => reportPathLink(path));
+}
+
+function reportPathLink(path, label = "") {
+  const text = label || path.split("/").filter(Boolean).pop() || path;
+  return `<a href="#" class="report-link" data-report-path="${escapeAttribute(path)}">${escapeHtml(text)}</a>`;
+}
+
+function isReportPath(path) {
+  return /\/\.codex-web\/reports\/[^\s<>()"']+\.md$/u.test(String(path || ""));
+}
+
 function renderComposer() {
-  const disabled = state.pendingTurn ? "disabled" : "";
+  const sendLabel = state.pendingTurn ? "追加指令" : "";
+  const sendButtonClass = `send-btn${state.pendingTurn ? " with-label" : ""}`;
   return `
-    <form class="composer" id="composer-form">
-      <div class="quick-row">
-        ${["修复报错", "解释代码", "运行测试", "总结改动"].map((item) => `<button type="button" data-quick="${escapeAttribute(item)}">${escapeHtml(item)}</button>`).join("")}
-      </div>
+    <form class="composer composer-tray" id="composer-form">
+      ${renderComposerStatus()}
+      ${renderQueuedMessages()}
       ${renderSelectedFiles()}
       <div class="composer-row">
-        <button type="button" class="icon-btn" id="attach-button" title="附加操作">+</button>
         <input id="file-input" type="file" multiple hidden>
-        <textarea id="prompt-input" rows="1" placeholder="向 Codex 描述你要完成的任务..." ${disabled}>${escapeHtml(state.prompt)}</textarea>
-        ${state.pendingTurn
-          ? `<button type="button" class="stop-btn" id="stop-button">${icon("stop")}</button>`
-          : `<button class="send-btn" type="submit" ${state.prompt.trim() ? "" : "disabled"}>${icon("send")}</button>`}
+        <textarea id="prompt-input" rows="1" placeholder="输入任务或追加指令">${escapeHtml(state.prompt)}</textarea>
+        <div class="composer-tool-row">
+          <div class="composer-leading-tools">
+            <button type="button" class="icon-btn" id="attach-button" title="附加文件">+</button>
+            <button type="button" class="icon-btn" data-command="/help" title="帮助">${icon("settings")}</button>
+            <button type="button" class="icon-btn" data-quick="总结改动" title="总结改动">${icon("sparkles")}</button>
+            <button type="button" class="icon-btn" data-quick="运行测试" title="运行测试">${icon("grid")}</button>
+          </div>
+          <div class="composer-actions">
+            <span class="composer-model-pill">${escapeHtml(modelLabel())}</span>
+            ${state.pendingTurn ? `<button type="button" class="queue-btn" id="queue-message-button" ${state.prompt.trim() ? "" : "disabled"} title="加入排队">${icon("clock")}<span>排队</span></button>` : ""}
+            ${state.pendingTurn ? `<button type="button" class="stop-btn" id="stop-button" title="停止">${icon("stop")}</button>` : ""}
+            <button class="${sendButtonClass}" id="send-button" type="submit" ${state.prompt.trim() ? "" : "disabled"} title="${state.pendingTurn ? "追加指令" : "发送"}">${icon("send")}${sendLabel ? `<span>${escapeHtml(sendLabel)}</span>` : ""}</button>
+          </div>
+        </div>
       </div>
       ${state.error ? `<div class="composer-error">${escapeHtml(state.error)}</div>` : ""}
     </form>
   `;
+}
+
+function renderComposerStatus() {
+  const statusMap = {
+    "Turn running": ["work", "Running"],
+    "Stream paused": ["warn", "Paused"],
+    "Turn failed": ["danger", "Failed"],
+    "Turn stopped": ["warn", "Stopped"],
+    Ready: ["success", "Done"],
+  };
+  const [tone, label] = statusMap[state.status] || (state.pendingTurn ? statusMap["Turn running"] : statusMap.Ready);
+  return `<div class="composer-status" data-tone="${tone}"><span>${label}</span></div>`;
+}
+
+function renderQueuedMessages() {
+  const messages = queuedMessagesForCurrentSession().filter((message) => !message.sending);
+  if (!state.pendingTurn && !messages.length) return "";
+  const guide = state.pendingTurn
+    ? `<div class="queue-guide"><strong>正在运行</strong><span>Enter 追加到当前任务；点“排队”会在本轮完成后自动发送。</span></div>`
+    : "";
+  const rows = messages.map((message) => `
+    <div class="queued-message-row" data-queued-message-id="${escapeAttribute(message.id)}">
+      <span class="queued-message-text">${escapeHtml(message.text)}</span>
+      <button type="button" data-remove-queued-message="${escapeAttribute(message.id)}" title="删除排队消息">删除</button>
+    </div>
+  `).join("");
+  return `<div class="queued-messages">${guide}${rows}</div>`;
 }
 
 function renderSelectedFiles() {
@@ -513,7 +928,7 @@ function renderSessionTools() {
           <button type="button" id="session-favorite">${isFavorite(state.currentSession) ? "取消收藏" : "收藏"}</button>
           <button type="button" id="session-archive">${state.currentSession?.archived ? "取消归档" : "归档"}</button>
         </div>
-        ${compactInput(state.currentSession ? "当前目录" : "新会话目录", "session-cwd-input", cwdValue, "/opt/workday", Boolean(state.currentSession))}
+        ${compactInput(state.currentSession ? "当前目录" : "新会话目录", "session-cwd-input", cwdValue, "/srv/codex-workbench", Boolean(state.currentSession))}
         ${compactSelect("会话模型", "session-model-select", modelOptions(), settings.model || state.model)}
         ${compactSelect("推理", "session-reasoning-select", reasoningOptions(), settings.reasoningEffort || "medium")}
         ${compactSelect("沙箱", "session-sandbox-select", sandboxOptions(), settings.sandboxMode || "danger-full-access")}
@@ -555,8 +970,8 @@ function renderSettings(mobile) {
     collaborationMode: state.defaultThreadSettings.collaborationMode || "default",
   };
   return `
-    <section class="settings-page">
-      <header class="settings-head">
+    <section class="settings-page workbench-page">
+      <header class="settings-head tool-page-head">
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div>
           <h1>设置</h1>
@@ -569,7 +984,7 @@ function renderSettings(mobile) {
           <div class="section-kicker">连接</div>
           ${settingStatic("服务地址", location.origin, "link")}
           ${settingStatic("登录状态", state.authSession?.principal?.mode ? `已登录 · ${state.authSession.principal.mode}` : "已登录", "user")}
-          ${settingInput("站点名称", "site-title-input", state.siteTitle, "Codex Web", !state.permissions?.canSetSiteTitle)}
+          ${settingInput("站点名称", "site-title-input", state.siteTitle, "Codex 远程工作台", !state.permissions?.canSetSiteTitle)}
         </section>
         <section class="open-section">
           <div class="section-kicker">默认运行参数</div>
@@ -637,21 +1052,21 @@ function renderCapabilities(mobile) {
     ["模型与推理", `${settings.model || modelLabel()} · ${settings.reasoningEffort || "medium"}`, "每个会话都可以单独调整模型、推理强度和协作模式", "sliders", "chat"],
     ["权限与沙箱", `${settings.sandboxMode || "danger-full-access"} · ${settings.approvalPolicy || "never"}`, "控制文件访问、命令执行和审批策略", "settings", "chat"],
     ["附件与文件上下文", state.selectedFiles.length ? `${state.selectedFiles.length} 个待发送文件` : "支持文件上传", "手机端可上传文件给 Codex 读取和处理", "doc", "chat"],
-    ["目标与命令", "/help · /goal", "Codex Web slash 命令可直接插入输入框", "code", "chat"],
+    ["目标与命令", "/status · /model · /plan", "远程工作台命令可直接插入输入框", "code", "chat"],
     ["报告", `${state.reports.length || "未加载"} 个`, "查看任务沉淀、帮助文档和报告内容", "doc", "reports"],
     ["运行时", usageText(), "刷新用量、重载运行时、清理缓存", "refresh", "settings"],
     ["用户与项目", state.admin.settings ? `${state.admin.users.length} 用户 · ${state.admin.projects.length} 项目` : "点击加载", "管理用户、角色、项目和多用户状态", "user", "admin"],
   ];
   return `
-    <section class="capabilities-page">
-      <header class="settings-head">
+    <section class="capabilities-page workbench-page">
+      <header class="settings-head tool-page-head">
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div>
-          <h1>能力</h1>
-          <p>手机端完整控制 Codex Web</p>
+          <h1>工作台</h1>
+          <p>远程会话、运行参数、命令和管理入口</p>
         </div>
       </header>
-      <section class="capability-hero">
+      <section class="capability-hero tool-hero">
         <div>
           <span>当前会话</span>
           <strong>${escapeHtml(state.currentSession ? sessionTitle(state.currentSession) : "未选择会话")}</strong>
@@ -659,9 +1074,9 @@ function renderCapabilities(mobile) {
         </div>
         <button class="primary" id="cap-new-session">新建任务</button>
       </section>
-      <section class="capability-list">
+      <section class="capability-list tool-list">
         ${capabilities.map(([title, value, desc, iconName, target]) => `
-          <button class="capability-row" data-capability-target="${escapeAttribute(target)}">
+          <button class="capability-row tool-row" data-capability-target="${escapeAttribute(target)}">
             <span class="setting-icon">${icon(iconName)}</span>
             <span>
               <strong>${escapeHtml(title)}</strong>
@@ -674,22 +1089,38 @@ function renderCapabilities(mobile) {
       <section class="open-section command-section">
         <div class="section-kicker">常用 Codex 命令</div>
         <div class="command-grid">
-          ${[
-            ["/help", "查看帮助"],
-            ["/goal", "查看目标"],
-            ["/goal set ", "设置目标"],
-            ["/goal clear", "清除目标"],
-          ].map(([command, label]) => `<button type="button" data-command="${escapeAttribute(command)}"><strong>${escapeHtml(command)}</strong><small>${escapeHtml(label)}</small></button>`).join("")}
+          ${remoteCommandButtons().map(([command, label]) => `<button type="button" data-command="${escapeAttribute(command)}"><strong>${escapeHtml(command)}</strong><small>${escapeHtml(label)}</small></button>`).join("")}
         </div>
       </section>
     </section>
   `;
 }
 
+function remoteCommandButtons() {
+  return [
+    ["/help", "帮助"],
+    ["/status", "状态"],
+    ["/model", "当前模型"],
+    ["/model ", "切换模型"],
+    ["/permissions", "权限"],
+    ["/permissions full-access", "完整访问"],
+    ["/permissions read-only", "只读"],
+    ["/plan ", "计划模式"],
+    ["/goal", "目标"],
+    ["/goal set ", "设置目标"],
+    ["/goal clear", "清除目标"],
+    ["/resume ", "恢复 thread"],
+    ["/fork ", "Fork thread"],
+    ["/mcp", "MCP"],
+    ["/skills", "Skills"],
+    ["/plugins", "Plugins"],
+  ];
+}
+
 function renderReports(mobile) {
   return `
-    <section class="reports-page">
-      <header class="settings-head">
+    <section class="reports-page workbench-page">
+      <header class="settings-head tool-page-head">
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div>
           <h1>报告</h1>
@@ -758,8 +1189,8 @@ function renderReportContent() {
 
 function renderAdmin(mobile) {
   return `
-    <section class="admin-page">
-      <header class="settings-head">
+    <section class="admin-page workbench-page">
+      <header class="settings-head tool-page-head">
         ${mobile ? `<button class="icon-btn" id="back-to-sessions">${icon("back")}</button>` : ""}
         <div>
           <h1>管理</h1>
@@ -822,11 +1253,11 @@ function renderAdminRoleForm(role = null) {
       <div class="admin-form-grid">
         <label>
           <span>角色 ID</span>
-          <input name="id" value="${escapeAttribute(id)}" placeholder="role_operator" ${isExisting ? "disabled" : ""}>
+          <input name="id" value="${escapeAttribute(id)}" placeholder="role_developer" ${isExisting ? "disabled" : ""}>
         </label>
         <label>
           <span>名称</span>
-          <input name="name" value="${escapeAttribute(role?.name || "")}" placeholder="Operator">
+          <input name="name" value="${escapeAttribute(role?.name || "")}" placeholder="开发协作者">
         </label>
       </div>
       ${renderRoleGrantMatrix(grants)}
@@ -890,7 +1321,7 @@ function renderAdminUserForm(user = null) {
       <div class="admin-form-head">
         <span>
           <strong>${escapeHtml(isExisting ? user.username : "新增用户")}</strong>
-          <small>${escapeHtml(isExisting ? `${enabled ? "启用" : "停用"} · ${roleLabel(user.roleId || user.roleIds?.[0] || "")}` : "创建后可登录 Codex Web")}</small>
+          <small>${escapeHtml(isExisting ? `${enabled ? "启用" : "停用"} · ${roleLabel(user.roleId || user.roleIds?.[0] || "")}` : "创建后可登录远程工作台")}</small>
         </span>
         <label class="switch-row">
           <input type="checkbox" name="enabled" ${enabled ? "checked" : ""}>
@@ -900,7 +1331,7 @@ function renderAdminUserForm(user = null) {
       <div class="admin-form-grid">
         <label>
           <span>用户名</span>
-          <input name="username" value="${escapeAttribute(user?.username || "")}" placeholder="operator" ${isExisting ? "disabled" : ""}>
+          <input name="username" value="${escapeAttribute(user?.username || "")}" placeholder="developer" ${isExisting ? "disabled" : ""}>
         </label>
         <label>
           <span>邮箱</span>
@@ -948,19 +1379,19 @@ function renderAdminProjectForm(project = null) {
       <div class="admin-form-grid">
         <label>
           <span>项目 ID</span>
-          <input name="id" value="${escapeAttribute(id)}" placeholder="auto or workday" ${isExisting ? "disabled" : ""}>
+          <input name="id" value="${escapeAttribute(id)}" placeholder="自动或 codex-workbench" ${isExisting ? "disabled" : ""}>
         </label>
         <label>
           <span>内部名</span>
-          <input name="internalName" value="${escapeAttribute(project?.internalName || "")}" placeholder="workday">
+          <input name="internalName" value="${escapeAttribute(project?.internalName || "")}" placeholder="codex-workbench">
         </label>
         <label>
           <span>显示名</span>
-          <input name="displayName" value="${escapeAttribute(project?.displayName || "")}" placeholder="Workday">
+          <input name="displayName" value="${escapeAttribute(project?.displayName || "")}" placeholder="Codex 工作台">
         </label>
         <label>
           <span>工作目录</span>
-          <input name="cwd" value="${escapeAttribute(project?.cwd || "")}" placeholder="/opt/workday">
+          <input name="cwd" value="${escapeAttribute(project?.cwd || "")}" placeholder="/srv/codex-workbench">
         </label>
         <label>
           <span>会话上限</span>
@@ -979,7 +1410,7 @@ function renderBottomNav() {
     <nav class="bottom-nav">
       <button class="${state.view === "sessions" || state.view === "chat" ? "active" : ""}" data-mobile-tab="sessions">${icon("message")}<span>会话</span></button>
       <button data-mobile-tab="new">${icon("plus")}<span>新建</span></button>
-      <button class="${state.view === "capabilities" ? "active" : ""}" data-mobile-tab="capabilities">${icon("sliders")}<span>能力</span></button>
+      <button class="${state.view === "capabilities" ? "active" : ""}" data-mobile-tab="capabilities">${icon("sliders")}<span>工作台</span></button>
       <button class="${state.view === "reports" ? "active" : ""}" data-mobile-tab="reports">${icon("doc")}<span>报告</span></button>
       <button class="${state.view === "settings" ? "active" : ""}" data-mobile-tab="settings">${icon("settings")}<span>设置</span></button>
     </nav>
@@ -1002,6 +1433,9 @@ function bindApp() {
     state.sessionToolsOpen = !state.sessionToolsOpen;
     render();
   });
+  document.querySelector("#toggle-workspace")?.addEventListener("click", toggleWorkspaceInspector);
+  document.querySelector("#refresh-workspace")?.addEventListener("click", () => refreshWorkspaceInspector());
+  document.querySelector("#show-more-timeline")?.addEventListener("click", showMoreTimelineHistory);
   document.querySelector("#session-settings-form")?.addEventListener("submit", saveSessionSettings);
   document.querySelector("#save-session-settings")?.addEventListener("click", saveSessionSettings);
   document.querySelector("#session-favorite")?.addEventListener("click", () => {
@@ -1037,10 +1471,7 @@ function bindApp() {
   });
 
   const search = document.querySelector("#session-search");
-  search?.addEventListener("input", (event) => {
-    state.search = event.target.value;
-    render();
-  });
+  search?.addEventListener("input", handleSessionSearchInput);
   for (const button of document.querySelectorAll("[data-filter]")) {
     button.addEventListener("click", async () => {
       state.sortMode = button.getAttribute("data-filter") || "all";
@@ -1054,7 +1485,7 @@ function bindApp() {
     button.addEventListener("click", () => {
       const target = button.getAttribute("data-capability-target") || "sessions";
       if (target === "chat") {
-        state.sessionToolsOpen = true;
+        state.sessionToolsOpen = false;
         state.view = state.currentSession || state.sessionId ? "chat" : "sessions";
         render();
         return;
@@ -1062,14 +1493,21 @@ function bindApp() {
       setView(target);
     });
   }
-  for (const button of document.querySelectorAll("[data-session-open]")) {
-    button.addEventListener("click", () => selectSession(button.getAttribute("data-session-open") || ""));
-  }
+  bindSessionListActions();
   for (const button of document.querySelectorAll("[data-report-open]")) {
     button.addEventListener("click", () => selectReport(button.getAttribute("data-report-open") || ""));
   }
+  for (const link of document.querySelectorAll("[data-report-path]")) {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      openReportByPath(link.getAttribute("data-report-path") || "");
+    });
+  }
   for (const button of document.querySelectorAll("[data-report-favorite]")) {
     button.addEventListener("click", () => toggleReportFavorite(button.getAttribute("data-report-favorite") || ""));
+  }
+  for (const button of document.querySelectorAll("[data-workspace-file]")) {
+    button.addEventListener("click", () => openWorkspaceFile(button.getAttribute("data-workspace-file") || ""));
   }
   for (const button of document.querySelectorAll("[data-remove-file]")) {
     button.addEventListener("click", () => {
@@ -1083,18 +1521,6 @@ function bindApp() {
       button.getAttribute("data-approval") || "",
       button.getAttribute("data-approval-action") || "deny",
     ));
-  }
-  for (const button of document.querySelectorAll("[data-favorite]")) {
-    button.addEventListener("click", (event) => {
-      event.stopPropagation();
-      toggleFavorite(button.getAttribute("data-favorite") || "");
-    });
-  }
-  for (const button of document.querySelectorAll("[data-archive]")) {
-    button.addEventListener("click", (event) => {
-      event.stopPropagation();
-      toggleArchive(button.getAttribute("data-archive") || "");
-    });
   }
   for (const button of document.querySelectorAll("[data-mobile-tab]")) {
     button.addEventListener("click", () => {
@@ -1120,21 +1546,89 @@ function bindApp() {
       render();
     });
   }
-  const textarea = document.querySelector("#prompt-input");
-  textarea?.addEventListener("input", (event) => {
-    state.prompt = event.target.value;
-    autoGrowTextarea(textarea);
-    updateSendButton();
-  });
-  textarea?.addEventListener("keydown", (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-      event.preventDefault();
-      document.querySelector("#composer-form")?.requestSubmit();
-    }
-  });
+  const promptInput = document.querySelector("#prompt-input");
+  if (promptInput) {
+    promptInput.addEventListener('touchstart', syncPromptFocusLayout, { passive: true });
+    promptInput.addEventListener('focus', syncPromptFocusLayout);
+    promptInput.addEventListener("input", (event) => {
+      state.prompt = event.target.value;
+      syncPromptInputLayout(event.target);
+      updateSendButton();
+    });
+    promptInput.addEventListener("keydown", handlePromptKeydown);
+  }
   document.querySelector("#composer-form")?.addEventListener("submit", sendPrompt);
+  document.querySelector("#send-button")?.addEventListener("click", handleComposerSendClick);
+  document.querySelector("#queue-message-button")?.addEventListener("click", queueCurrentPrompt);
+  for (const button of document.querySelectorAll("[data-remove-queued-message]")) {
+    button.addEventListener("click", () => {
+      const sessionId = currentQueueSessionId();
+      removeQueuedMessage(sessionId, button.getAttribute("data-remove-queued-message") || "");
+      render();
+    });
+  }
   document.querySelector("#stop-button")?.addEventListener("click", stopTurn);
   document.querySelector("#retry-last")?.addEventListener("click", retryLastUserMessage);
+}
+
+function handlePromptKeydown(event) {
+  if (event?.key !== "Enter") return;
+  if (event.shiftKey || event.altKey || event.isComposing) return;
+  event.preventDefault();
+  requestComposerSubmit();
+}
+
+function handleComposerSendClick(event) {
+  event?.preventDefault?.();
+  requestComposerSubmit();
+}
+
+function requestComposerSubmit() {
+  const form = document.querySelector("#composer-form");
+  if (typeof form?.requestSubmit === "function") {
+    form.requestSubmit();
+    return;
+  }
+  return onComposerSubmit({ preventDefault() {} });
+}
+
+function handleSessionSearchInput(event) {
+  state.search = event.target.value;
+  if (!state.isMobile && renderSidebarRecentsOnly()) {
+    return;
+  }
+  render();
+}
+
+function renderSidebarRecentsOnly() {
+  const recents = document.querySelector("#sidebar-recents");
+  if (!recents) {
+    return false;
+  }
+  recents.innerHTML = renderSidebarRecentsContent();
+  bindSessionListActions(recents);
+  return true;
+}
+
+function bindSessionListActions(root = document) {
+  const queryAll = typeof root.querySelectorAll === "function"
+    ? (selector) => root.querySelectorAll(selector)
+    : (selector) => document.querySelectorAll(selector);
+  for (const button of queryAll("[data-session-open]")) {
+    button.addEventListener("click", () => selectSession(button.getAttribute("data-session-open") || ""));
+  }
+  for (const button of queryAll("[data-favorite]")) {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleFavorite(button.getAttribute("data-favorite") || "");
+    });
+  }
+  for (const button of queryAll("[data-archive]")) {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleArchive(button.getAttribute("data-archive") || "");
+    });
+  }
 }
 
 async function setView(view) {
@@ -1222,6 +1716,85 @@ async function selectReport(reportId, { silent = false } = {}) {
   }
 }
 
+async function openReportByPath(reportPath) {
+  const path = String(reportPath || "").trim();
+  if (!path) return;
+  state.view = "reports";
+  state.reportLoading = true;
+  state.currentReport = {
+    id: path,
+    title: path.split("/").filter(Boolean).pop() || "报告",
+    path,
+  };
+  state.reportContent = "";
+  render();
+  try {
+    const payload = await apiFetch("/api/reports/resolve", {
+      method: "POST",
+      body: { path },
+    });
+    if (payload?.report) {
+      state.currentReport = payload.report;
+      upsertReport(payload.report);
+      await selectReport(payload.report.id, { silent: true });
+    }
+  } catch (error) {
+    state.reportContent = error?.payload?.message || error?.message || "报告打开失败";
+  } finally {
+    state.reportLoading = false;
+    render();
+  }
+}
+
+async function toggleWorkspaceInspector() {
+  state.workspaceOpen = !state.workspaceOpen;
+  if (!state.workspaceOpen) {
+    render();
+    return;
+  }
+  render();
+  await refreshWorkspaceInspector();
+}
+
+async function refreshWorkspaceInspector() {
+  const sessionId = state.currentSession?.id || state.sessionId;
+  if (!sessionId) return;
+  state.workspaceLoading = true;
+  state.workspaceError = "";
+  render();
+  try {
+    const [statusPayload, diffPayload] = await Promise.all([
+      apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/workspace/status`),
+      apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/workspace/diff`),
+    ]);
+    state.workspaceStatus = statusPayload?.status || null;
+    state.workspaceDiff = diffPayload?.diff || null;
+  } catch (error) {
+    state.workspaceError = error?.payload?.message || error?.message || "工作区读取失败";
+  } finally {
+    state.workspaceLoading = false;
+    renderAfterBackgroundRefresh();
+  }
+}
+
+async function openWorkspaceFile(filePath) {
+  const sessionId = state.currentSession?.id || state.sessionId;
+  const pathValue = String(filePath || "").trim();
+  if (!sessionId || !pathValue) return;
+  state.workspaceLoading = true;
+  state.workspaceError = "";
+  render();
+  try {
+    const payload = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/workspace/files?path=${encodeURIComponent(pathValue)}`);
+    state.workspaceFile = payload?.file || null;
+  } catch (error) {
+    state.workspaceError = error?.payload?.message || error?.message || "文件读取失败";
+  } finally {
+    state.workspaceLoading = false;
+    renderAfterBackgroundRefresh();
+  }
+}
+
 async function refreshAdmin() {
   state.adminLoading = true;
   render();
@@ -1267,9 +1840,11 @@ async function refreshSessions({ silent = false } = {}) {
 
 async function selectSession(sessionId) {
   const cached = state.sessions.find((session) => session.id === sessionId) || null;
+  state.draftSessionActive = false;
   state.sessionId = sessionId;
   state.currentSession = cached;
-  state.timeline = cached ? hydrateTimeline(cached) : [];
+  resetTimelineRenderLimit();
+  state.timeline = cached ? hydrateTimelineFromSession(cached) : [];
   state.view = state.isMobile ? "chat" : "sessions";
   state.status = "Loading session";
   state.statusTone = "warn";
@@ -1284,33 +1859,295 @@ async function refreshCurrentSession({ silent = false } = {}) {
     state.status = "Loading session";
     state.statusTone = "warn";
   }
+  return refreshCurrentSessionMetadata({ hydrateTimeline: true, silent });
+}
+
+async function refreshCurrentSessionMetadata(options = {}) {
+  const shouldHydrateTimeline = options.hydrateTimeline === true;
+  if (!state.sessionId) return null;
   const payload = await apiFetch(`/api/sessions/${encodeURIComponent(state.sessionId)}`);
   if (payload?.session) {
     upsertSession(payload.session);
     state.currentSession = payload.session;
-    state.timeline = hydrateTimeline(payload.session);
+    if (shouldHydrateTimeline) {
+      state.timeline = hydrateTimelineFromSession(payload.session);
+    }
     const active = findActiveTurn(payload.session);
     if (active?.id) {
       state.pendingTurn = true;
       state.turnId = active.id;
       state.status = "Turn running";
       state.statusTone = "warn";
-      streamTurn(active.id);
+      if (!isTurnStreamHealthy()) {
+        void streamTurnEvents(active.id, { forceReconnect: true });
+      }
     } else {
       state.pendingTurn = false;
-      state.turnId = "";
+      state.turnId = null;
+      state.streamWasBackgrounded = false;
       state.status = statusFromSession(payload.session).status;
       state.statusTone = statusFromSession(payload.session).tone;
+      stopStream(false);
     }
   }
-  render();
+  if (options.viewportSnapshot?.shouldFollowLatest || state.timelineShouldFollowLatest) {
+    state.timelineShouldFollowLatest = true;
+  }
+  renderAfterBackgroundRefresh();
+  scrollTimelineToBottomIfFollowingLatest();
   return payload?.session || null;
+}
+
+async function refreshCurrentView() {
+  if (state.view === "chat" && state.sessionId) {
+    return refreshCurrentSessionMetadata({ hydrateTimeline: true });
+  }
+  if (state.view === "reports") {
+    return refreshReports();
+  }
+  if (state.view === "admin") {
+    return refreshAdmin();
+  }
+  return refreshSessions({ silent: true });
+}
+
+function connectWorkspaceEvents({ forceReconnect = false } = {}) {
+  if (!state.token) return Promise.resolve();
+  if (
+    !forceReconnect
+    && state.workspaceAbortController
+    && !state.workspaceAbortController.signal.aborted
+  ) {
+    return Promise.resolve();
+  }
+  stopWorkspaceEvents();
+  const controller = new AbortController();
+  state.workspaceAbortController = controller;
+  const stream = readWorkspaceSse(controller)
+    .catch((error) => {
+      if (controller.signal.aborted) return;
+      if (error?.status === 401) {
+        handleApiError(error, { auth: true });
+        return;
+      }
+      scheduleWorkspaceReconnect();
+    })
+    .then(() => {
+      if (!controller.signal.aborted) {
+        scheduleWorkspaceReconnect();
+      }
+    });
+  return stream;
+}
+
+function scheduleWorkspaceEventsConnect(options = {}) {
+  if (!state.token) return;
+  const connectAfterQuietPeriod = () => {
+    if (workspaceEventsDeferredTimer) clearTimeout(workspaceEventsDeferredTimer);
+    workspaceEventsDeferredTimer = setTimeout(() => {
+      workspaceEventsDeferredTimer = null;
+      connectWorkspaceEvents(options);
+    }, 350);
+  };
+  if (document.readyState === "complete") {
+    connectAfterQuietPeriod();
+    return;
+  }
+  if (workspaceEventsConnectAfterLoadAttached) return;
+  workspaceEventsConnectAfterLoadAttached = true;
+  window.addEventListener("load", () => {
+    workspaceEventsConnectAfterLoadAttached = false;
+    connectAfterQuietPeriod();
+  }, { once: true });
+}
+
+function stopWorkspaceEvents({ clearCursor = false } = {}) {
+  if (workspaceEventsDeferredTimer) {
+    clearTimeout(workspaceEventsDeferredTimer);
+    workspaceEventsDeferredTimer = null;
+  }
+  if (state.workspaceReconnectTimer) {
+    clearTimeout(state.workspaceReconnectTimer);
+    state.workspaceReconnectTimer = null;
+  }
+  if (state.workspaceAbortController) {
+    state.workspaceAbortController.abort();
+    state.workspaceAbortController = null;
+  }
+  if (clearCursor) {
+    state.lastWorkspaceEventSequence = null;
+  }
+}
+
+function scheduleWorkspaceReconnect() {
+  if (!state.token || state.workspaceReconnectTimer) return;
+  state.workspaceReconnectTimer = setTimeout(() => {
+    state.workspaceReconnectTimer = null;
+    connectWorkspaceEvents({ forceReconnect: true });
+  }, 1000);
+  if (typeof state.workspaceReconnectTimer?.unref === "function") {
+    state.workspaceReconnectTimer.unref();
+  }
+}
+
+async function readWorkspaceSse(controller) {
+  const after = state.lastWorkspaceEventSequence
+    ? `?after=${encodeURIComponent(String(state.lastWorkspaceEventSequence))}`
+    : "";
+  const response = await fetch(`/api/workspace/events${after}`, {
+    headers: { Authorization: `Bearer ${state.token}`, Accept: "text/event-stream" },
+    signal: controller.signal,
+  });
+  if (!response.ok || !response.body) throw await buildApiError(response);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      processWorkspaceSseFrame(frame);
+      boundary = buffer.indexOf("\n\n");
+    }
+  }
+  if (buffer.trim()) processWorkspaceSseFrame(buffer);
+}
+
+function processWorkspaceSseFrame(frame) {
+  const lines = frame.split(/\r?\n/u);
+  let eventName = "message";
+  const data = [];
+  for (const line of lines) {
+    if (line.startsWith("event:")) eventName = line.slice(6).trim();
+    if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+    if (line.startsWith("id:")) state.lastWorkspaceEventSequence = line.slice(3).trim();
+  }
+  if (eventName !== "message" || !data.length) return;
+  try {
+    void applyWorkspaceEvent(JSON.parse(data.join("\n")));
+  } catch (_error) {
+  }
+}
+
+function applyWorkspaceEvent(event) {
+  if (!event || typeof event !== "object") return Promise.resolve([]);
+  if (event.sequence) state.lastWorkspaceEventSequence = event.sequence;
+  const eventSessionId = event.sessionId || event.threadId || "";
+  return enqueueWorkspaceRefresh({
+    sessions: shouldRefreshSessionsForWorkspaceEvent(event),
+    currentSessionId: eventSessionId && state.sessionId && eventSessionId === state.sessionId
+      ? state.sessionId
+      : "",
+    reports: event.type === "report.updated" && (state.view === "reports" || state.currentReport),
+  });
+}
+
+function enqueueWorkspaceRefresh({ sessions = false, currentSessionId = "", reports = false } = {}) {
+  if (sessions) workspaceRefreshQueue.sessions = true;
+  if (currentSessionId) workspaceRefreshQueue.currentSessionIds.add(currentSessionId);
+  if (reports) workspaceRefreshQueue.reports = true;
+  if (!workspaceRefreshQueue.promise) {
+    workspaceRefreshQueue.promise = new Promise((resolve) => {
+      workspaceRefreshQueue.resolve = resolve;
+    });
+  }
+  if (!workspaceRefreshQueue.scheduled) {
+    workspaceRefreshQueue.scheduled = true;
+    Promise.resolve().then(flushWorkspaceRefreshQueue);
+  }
+  return workspaceRefreshQueue.promise;
+}
+
+async function flushWorkspaceRefreshQueue() {
+  workspaceRefreshQueue.scheduled = false;
+  const refreshSessionsNeeded = workspaceRefreshQueue.sessions;
+  const refreshCurrentSessionIds = new Set(workspaceRefreshQueue.currentSessionIds);
+  const refreshReportsNeeded = workspaceRefreshQueue.reports;
+  const resolve = workspaceRefreshQueue.resolve;
+  workspaceRefreshQueue.sessions = false;
+  workspaceRefreshQueue.currentSessionIds.clear();
+  workspaceRefreshQueue.reports = false;
+  workspaceRefreshQueue.promise = null;
+  workspaceRefreshQueue.resolve = null;
+
+  const refreshes = [];
+  if (refreshSessionsNeeded) {
+    refreshes.push(refreshSessions({ silent: true }).catch(() => null));
+  }
+  if (state.sessionId && refreshCurrentSessionIds.has(state.sessionId)) {
+    refreshes.push(refreshCurrentSessionMetadata({ hydrateTimeline: true }).catch(() => null));
+  }
+  if (refreshReportsNeeded) {
+    refreshes.push(refreshReports().catch(() => null));
+  }
+  const results = await Promise.all(refreshes);
+  resolve?.(results);
+}
+
+function shouldRefreshSessionsForWorkspaceEvent(event) {
+  return event.type === "session.created"
+    || event.type === "session.updated"
+    || event.type === "session.archived"
+    || event.type === "session.unarchived"
+    || event.type === "session.favorite.updated"
+    || event.type === "turn.started"
+    || event.type === "turn.completed"
+    || event.type === "turn.failed"
+    || event.type === "approval.requested"
+    || event.type === "approval.resolved";
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState === "hidden") {
+    state.lastTimelineViewportSnapshot = captureTimelineViewport();
+    if (state.pendingTurn && state.turnId) {
+      state.streamWasBackgrounded = true;
+    }
+    return;
+  }
+  if (document.visibilityState === "visible") {
+    onPageResume();
+  }
+}
+
+function onPageResume() {
+  if (!state.token && !state.authSession) return;
+  if (isFormControlInteractionActive()) return;
+  void recoverActiveTurnAfterForeground();
+}
+
+function isTurnStreamHealthy() {
+  if (!state.pendingTurn || !state.turnId || !state.streamAbortController) return false;
+  if (state.streamAbortController.signal.aborted) return false;
+  if (state.streamWasBackgrounded) return false;
+  return Date.now() - (state.streamLastEventAt || state.streamStartedAt || 0) < 45_000;
+}
+
+async function recoverActiveTurnAfterForeground() {
+  if (!state.sessionId) {
+    await refreshSessions({ silent: true }).catch(() => null);
+    return;
+  }
+  const viewportSnapshot = state.lastTimelineViewportSnapshot || captureTimelineViewport();
+  await refreshCurrentSessionMetadata({ hydrateTimeline: true, viewportSnapshot });
+  if (state.pendingTurn && state.turnId && !isTurnStreamHealthy()) {
+    await streamTurnEvents(state.turnId, { forceReconnect: true });
+  }
+  state.lastTimelineViewportSnapshot = null;
+  state.timelineShouldFollowLatest = true;
+  scrollTimelineToBottomIfFollowingLatest();
 }
 
 async function openNewSession() {
   stopStream();
   state.currentSession = null;
   state.sessionId = "";
+  state.draftSessionActive = true;
+  resetTimelineRenderLimit();
   state.timeline = [];
   state.prompt = "";
   state.pendingTurn = false;
@@ -1318,9 +2155,9 @@ async function openNewSession() {
   state.error = "";
   state.status = "Ready";
   state.statusTone = "success";
-  state.sessionToolsOpen = true;
+  state.sessionToolsOpen = false;
   state.view = "chat";
-  render();
+  render({ preserveComposer: false });
 }
 
 async function ensureSession() {
@@ -1330,8 +2167,10 @@ async function ensureSession() {
     body: { cwd: defaultCwdForCreate() || null, settings: collectSettings() },
   });
   const session = payload.session;
+  state.draftSessionActive = false;
   state.sessionId = session.id;
   state.currentSession = session;
+  resetTimelineRenderLimit();
   upsertSession(session);
   return state.sessionId;
 }
@@ -1352,14 +2191,19 @@ async function uploadSessionFiles(sessionId, files) {
 async function sendPrompt(event) {
   event.preventDefault();
   const text = state.prompt.trim();
-  if (!text || state.pendingTurn) return;
+  if (!text) return;
+  if (state.pendingTurn && state.turnId) {
+    await sendSteeringPrompt(text);
+    return;
+  }
+  if (state.pendingTurn) return;
   state.error = "";
   state.prompt = "";
   state.pendingTurn = true;
   state.status = "Turn running";
   state.statusTone = "warn";
   appendTimeline({ id: `local_user_${Date.now()}`, kind: "message", role: "user", meta: "sending", text });
-  render();
+  render({ preserveComposer: false });
   try {
     const sessionId = await ensureSession();
     const attachments = state.selectedFiles.length ? await uploadSessionFiles(sessionId, state.selectedFiles) : [];
@@ -1369,11 +2213,26 @@ async function sendPrompt(event) {
       body: { text, attachments, settings: collectSettings() },
     });
     if (turn?.session) {
+      state.sessionId = turn.session.id || state.sessionId;
       state.currentSession = turn.session;
       upsertSession(turn.session);
+      state.timeline = hydrateTimelineFromSession(turn.session);
+      const nextStatus = statusFromSession(turn.session);
+      state.status = nextStatus.status;
+      state.statusTone = nextStatus.tone;
+    }
+    if (turn?.type === "command") {
+      state.pendingTurn = false;
+      state.turnId = "";
+      if (turn.command?.draftPrompt) {
+        state.prompt = turn.command.draftPrompt;
+      }
+      render();
+      return;
     }
     state.turnId = turn.turnId || "";
     if (state.turnId) {
+      state.lastTurnEventSequence = null;
       streamTurn(state.turnId);
     } else {
       state.pendingTurn = false;
@@ -1393,32 +2252,92 @@ async function sendPrompt(event) {
   }
 }
 
+async function sendSteeringPrompt(text) {
+  const turnId = state.turnId;
+  if (!turnId) return;
+  state.error = "";
+  state.prompt = "";
+  state.pendingTurn = true;
+  state.status = "Turn running";
+  state.statusTone = "warn";
+  appendTimeline({ id: `local_steer_${Date.now()}`, kind: "message", role: "user", meta: "steering", text });
+  render({ preserveComposer: false });
+  try {
+    const attachments = state.selectedFiles.length && state.sessionId
+      ? await uploadSessionFiles(state.sessionId, state.selectedFiles)
+      : [];
+    state.selectedFiles = [];
+    await apiFetch(`/api/turns/${encodeURIComponent(turnId)}/steer`, {
+      method: "POST",
+      body: { text, attachments },
+    });
+    state.pendingTurn = true;
+    state.turnId = turnId;
+    state.status = "Turn running";
+    state.statusTone = "warn";
+    render();
+  } catch (error) {
+    if (error?.status === 401 || error?.payload?.error === "setup_required") {
+      handleApiError(error, { auth: error?.status === 401 });
+      return;
+    }
+    state.pendingTurn = true;
+    state.turnId = turnId;
+    state.status = "Turn running";
+    state.statusTone = "warn";
+    state.error = error?.payload?.message || error?.message || "追加指令失败";
+    appendTimeline({
+      id: `steer_error_${Date.now()}`,
+      kind: "message",
+      role: "system",
+      severity: "error",
+      meta: "failed",
+      text: state.error,
+    });
+    render();
+  }
+}
+
+function onComposerSubmit(event) {
+  return sendPrompt(event);
+}
+
 function streamTurn(turnId) {
+  void streamTurnEvents(turnId);
+}
+
+async function streamTurnEvents(turnId, { forceReconnect = false } = {}) {
+  if (!turnId) return;
+  if (!forceReconnect && state.streamAbortController && state.turnId === turnId && isTurnStreamHealthy()) {
+    return;
+  }
   stopStream(false);
   const controller = new AbortController();
   state.streamAbortController = controller;
   state.turnId = turnId;
   state.pendingTurn = true;
-  state.lastTurnEventSequence = null;
-  readSse(turnId, controller).catch((error) => {
+  state.status = "Turn running";
+  state.statusTone = "warn";
+  state.streamStartedAt = Date.now();
+  state.streamLastEventAt = Date.now();
+  state.streamWasBackgrounded = false;
+  try {
+    await readSse(turnId, controller);
     if (controller.signal.aborted) return;
-    state.pendingTurn = false;
-    state.status = "Turn failed";
-    state.statusTone = "danger";
-    appendTimeline({
-      id: `stream_error_${Date.now()}`,
-      kind: "message",
-      role: "system",
-      severity: "error",
-      meta: "stream",
-      text: error?.payload?.message || error?.message || "流式连接失败",
-    });
-    render();
-  });
+    if (state.pendingTurn && state.turnId === turnId) {
+      markStreamPaused();
+    }
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    markStreamPaused(error);
+  }
 }
 
 async function readSse(turnId, controller) {
-  const response = await fetch(`/api/turns/${encodeURIComponent(turnId)}/events`, {
+  const after = state.lastTurnEventSequence
+    ? `?after=${encodeURIComponent(String(state.lastTurnEventSequence))}`
+    : "";
+  const response = await fetch(`/api/turns/${encodeURIComponent(turnId)}/events${after}`, {
     headers: { Authorization: `Bearer ${state.token}`, Accept: "text/event-stream" },
     signal: controller.signal,
   });
@@ -1441,7 +2360,16 @@ async function readSse(turnId, controller) {
   if (buffer.trim()) processSseFrame(buffer);
 }
 
+function markStreamPaused() {
+  state.pendingTurn = true;
+  state.streamWasBackgrounded = true;
+  state.status = "Stream paused";
+  state.statusTone = "warn";
+  renderAfterBackgroundRefresh();
+}
+
 function processSseFrame(frame) {
+  state.streamLastEventAt = Date.now();
   const lines = frame.split(/\r?\n/u);
   let eventName = "message";
   const data = [];
@@ -1501,14 +2429,22 @@ function applyTurnEvent(event) {
     });
   } else if (event.type === "turn.completed") {
     state.pendingTurn = false;
-    state.turnId = "";
-    state.status = "Ready";
-    state.statusTone = "success";
+    state.turnId = null;
+    state.streamWasBackgrounded = false;
+    if (isInterruptedStatus(event.status)) {
+      state.status = "Turn stopped";
+      state.statusTone = "warn";
+    } else {
+      state.status = "Ready";
+      state.statusTone = "success";
+    }
     stopStream(false);
+    sendNextQueuedMessage(state.sessionId || state.currentSession?.id || "").catch(handleApiError);
     refreshCurrentSession({ silent: true }).catch(() => null);
   } else if (event.type === "turn.failed") {
     state.pendingTurn = false;
-    state.turnId = "";
+    state.turnId = null;
+    state.streamWasBackgrounded = false;
     state.status = "Turn failed";
     state.statusTone = "danger";
     appendTimeline({
@@ -1890,10 +2826,12 @@ async function logout() {
   } catch (_error) {
   }
   stopStream();
+  stopWorkspaceEvents({ clearCursor: true });
   state.token = "";
   state.authSession = null;
   state.currentSession = null;
   state.sessionId = "";
+  state.draftSessionActive = false;
   localStorage.removeItem(TOKEN_KEY);
   render();
 }
@@ -1962,6 +2900,10 @@ function hydrateTimeline(session) {
   return items;
 }
 
+function hydrateTimelineFromSession(session) {
+  return hydrateTimeline(session);
+}
+
 function normalizeTimeline(items) {
   return (Array.isArray(items) ? items : []).map((item) => {
     if (!item || item.kind !== "message") return null;
@@ -1972,6 +2914,7 @@ function normalizeTimeline(items) {
       id: item.id || `timeline_${Date.now()}_${Math.random()}`,
       kind: "message",
       role,
+      label: typeof item.label === "string" ? item.label : undefined,
       meta: item.meta || "",
       text,
       severity: item.severity === "error" ? "error" : undefined,
@@ -2014,6 +2957,10 @@ function upsertTimelineWork(id, item) {
   replaceTimeline((entry) => entry.id === item.id || entry.batchId === id, item);
 }
 
+function saveCurrentTimeline() {
+  return null;
+}
+
 function upsertSession(session) {
   if (!session?.id) return;
   const normalized = normalizeSessions({ items: [session] }, state.sortMode)[0] || session;
@@ -2025,6 +2972,16 @@ function upsertSession(session) {
   }
   if (state.currentSession?.id === session.id) {
     state.currentSession = { ...state.currentSession, ...session };
+  }
+}
+
+function upsertReport(report) {
+  if (!report?.id) return;
+  const index = state.reports.findIndex((item) => item.id === report.id);
+  if (index >= 0) {
+    state.reports[index] = { ...state.reports[index], ...report };
+  } else {
+    state.reports.unshift(report);
   }
 }
 
@@ -2044,6 +3001,21 @@ function sessionTitle(session) {
     || cwdLeafName(session?.projectName)
     || cwdLeafName(session?.cwd)
     || "新会话";
+}
+
+function firstInputForSession(session) {
+  if (typeof session?.firstUserInput === "string" && session.firstUserInput.trim()) {
+    return session.firstUserInput.trim();
+  }
+  const turns = Array.isArray(session?.thread?.turns) ? session.thread.turns : [];
+  for (const turn of turns) {
+    for (const item of Array.isArray(turn?.items) ? turn.items : []) {
+      const role = inferThreadRole(item);
+      const text = extractThreadText(item);
+      if (role === "user" && text) return text;
+    }
+  }
+  return firstLine(session?.preview || "");
 }
 
 function sessionPreview(session) {
@@ -2202,6 +3174,108 @@ function loadDefaultThreadSettings() {
   }
 }
 
+function loadQueuedMessages() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(QUEUED_MESSAGES_KEY) || "{}");
+    const entries = Object.entries(raw || {}).map(([sessionId, items]) => [
+      sessionId,
+      (Array.isArray(items) ? items : [])
+        .map((item) => ({
+          id: String(item?.id || `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+          text: String(item?.text || "").trim(),
+          sending: item?.sending === true,
+        }))
+        .filter((item) => item.text),
+    ]);
+    return new Map(entries.filter(([, items]) => items.length));
+  } catch (_error) {
+    return new Map();
+  }
+}
+
+function persistQueuedMessages() {
+  const payload = {};
+  for (const [sessionId, messages] of state.queuedMessages.entries()) {
+    const active = messages
+      .filter((message) => message?.text)
+      .map((message) => ({ id: message.id, text: message.text, sending: message.sending === true }));
+    if (active.length) payload[sessionId] = active;
+  }
+  if (Object.keys(payload).length) {
+    localStorage.setItem(QUEUED_MESSAGES_KEY, JSON.stringify(payload));
+  } else {
+    localStorage.removeItem(QUEUED_MESSAGES_KEY);
+  }
+}
+
+function currentQueueSessionId() {
+  return state.sessionId || state.currentSession?.id || "__draft__";
+}
+
+function queuedMessagesForSession(sessionId) {
+  const key = sessionId || "__draft__";
+  if (!(state.queuedMessages instanceof Map)) state.queuedMessages = new Map();
+  return state.queuedMessages.get(key) || [];
+}
+
+function queuedMessagesForCurrentSession() {
+  return queuedMessagesForSession(currentQueueSessionId());
+}
+
+function enqueueQueuedMessage(sessionId, text) {
+  const key = sessionId || "__draft__";
+  const value = String(text || "").trim();
+  if (!value) return null;
+  const message = {
+    id: `queued_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    text: value,
+    sending: false,
+  };
+  const messages = queuedMessagesForSession(key);
+  state.queuedMessages.set(key, [...messages, message]);
+  persistQueuedMessages();
+  return message;
+}
+
+function removeQueuedMessage(sessionId, messageId) {
+  const key = sessionId || "__draft__";
+  const next = queuedMessagesForSession(key).filter((message) => message.id !== messageId);
+  if (next.length) state.queuedMessages.set(key, next);
+  else state.queuedMessages.delete(key);
+  persistQueuedMessages();
+}
+
+function queueCurrentPrompt(event) {
+  event?.preventDefault?.();
+  const text = state.prompt.trim();
+  if (!text) return;
+  enqueueQueuedMessage(currentQueueSessionId(), text);
+  state.prompt = "";
+  state.notice = "已加入排队，本轮完成后自动发送";
+  render({ preserveComposer: false });
+}
+
+async function sendNextQueuedMessage(sessionId) {
+  const key = sessionId || currentQueueSessionId();
+  if (!key || state.pendingTurn) return null;
+  const messages = queuedMessagesForSession(key);
+  const next = messages.find((message) => !message.sending);
+  if (!next) return null;
+  next.sending = true;
+  persistQueuedMessages();
+  renderAfterBackgroundRefresh();
+  try {
+    state.prompt = next.text;
+    await sendPrompt({ preventDefault() {} });
+    removeQueuedMessage(key, next.id);
+    return next;
+  } catch (error) {
+    next.sending = false;
+    persistQueuedMessages();
+    throw error;
+  }
+}
+
 function applyTheme(theme, options = {}) {
   state.theme = theme === "glass" ? "glass" : "light";
   document.documentElement.dataset.theme = state.theme;
@@ -2272,29 +3346,144 @@ function renderAfterBackgroundRefresh() {
   render();
 }
 
+function captureFocusedComposerState() {
+  const input = document.querySelector("#prompt-input");
+  if (!input || document.activeElement !== input) return null;
+  const value = String(input.value || "");
+  state.prompt = value;
+  return {
+    value,
+    selectionStart: typeof input.selectionStart === "number" ? input.selectionStart : value.length,
+    selectionEnd: typeof input.selectionEnd === "number" ? input.selectionEnd : value.length,
+  };
+}
+
+function restoreFocusedComposerState(snapshot) {
+  if (!snapshot) return;
+  const input = document.querySelector("#prompt-input");
+  if (!input) return;
+  state.prompt = snapshot.value;
+  input.value = snapshot.value;
+  input.selectionStart = snapshot.selectionStart;
+  input.selectionEnd = snapshot.selectionEnd;
+  input.focus();
+  syncPromptInputLayout(input);
+  updateSendButton();
+}
+
 function isFormControl(element) {
-  if (!(element instanceof Element)) return false;
-  return Boolean(element.closest("input, select, textarea, [contenteditable='true']"));
+  if (!element) return false;
+  if (typeof Element !== "undefined" && !(element instanceof Element)) return false;
+  return Boolean(element.closest?.("input, select, textarea, [contenteditable='true']"));
 }
 
 function scrollChatToBottom() {
-  const messages = document.querySelector("#messages");
-  if (messages) messages.scrollTop = messages.scrollHeight;
+  const timeline = getTimelineElement();
+  if (timeline) timeline.scrollTop = timeline.scrollHeight;
+}
+
+function getTimelineElement() {
+  return document.querySelector("#timeline") || document.querySelector("#messages");
+}
+
+function captureTimelineViewport() {
+  const timeline = getTimelineElement();
+  if (!timeline) {
+    return { shouldFollowLatest: state.timelineShouldFollowLatest };
+  }
+  const distanceFromBottom = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight;
+  return {
+    scrollTop: timeline.scrollTop,
+    scrollHeight: timeline.scrollHeight,
+    clientHeight: timeline.clientHeight,
+    shouldFollowLatest: state.timelineShouldFollowLatest || distanceFromBottom <= 32,
+  };
+}
+
+function updateTimelineFollowState() {
+  const timeline = getTimelineElement();
+  if (!timeline) {
+    state.timelineShouldFollowLatest = true;
+    return;
+  }
+  state.timelineShouldFollowLatest = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight <= 32;
+}
+
+function scrollTimelineToBottomIfFollowingLatest() {
+  if (!state.timelineShouldFollowLatest) return;
+  requestAnimationFrame(() => {
+    const timeline = getTimelineElement();
+    if (timeline) timeline.scrollTop = timeline.scrollHeight;
+  });
+}
+
+function syncPromptFocusLayout(eventOrTextarea) {
+  const textarea = eventOrTextarea?.target || eventOrTextarea;
+  if (!textarea) return;
+  markFormControlInteraction();
+  protectPromptFocusScroll();
+  syncPromptInputLayout(textarea);
+  requestAnimationFrame(() => {
+    syncPromptInputLayout(textarea);
+    scheduleTimelineViewportRestore();
+  });
+  if (promptFocusLayoutTimer) clearTimeout(promptFocusLayoutTimer);
+  promptFocusLayoutTimer = setTimeout(() => {
+    syncPromptInputLayout(textarea);
+    scheduleTimelineViewportRestore();
+    promptFocusLayoutTimer = null;
+  }, 120);
+}
+
+function syncPromptInputLayout(textarea) {
+  autoGrowTextarea(textarea);
+}
+
+function protectPromptFocusScroll() {
+  state.lastTimelineViewportSnapshot = captureTimelineViewport();
+  scheduleTimelineViewportRestore(state.lastTimelineViewportSnapshot);
+}
+
+function scheduleTimelineViewportRestore(snapshot = state.lastTimelineViewportSnapshot) {
+  if (!snapshot) return;
+  const restore = () => restoreTimelineViewport(snapshot);
+  requestAnimationFrame(restore);
+  if (promptFocusRestoreTimer) clearTimeout(promptFocusRestoreTimer);
+  promptFocusRestoreTimer = setTimeout(() => {
+    restore();
+    promptFocusRestoreTimer = null;
+  }, 180);
+}
+
+function restoreTimelineViewport(snapshot) {
+  const timeline = getTimelineElement();
+  if (!timeline || !snapshot) return;
+  if (snapshot.shouldFollowLatest) {
+    timeline.scrollTop = timeline.scrollHeight;
+    state.timelineShouldFollowLatest = true;
+    return;
+  }
+  timeline.scrollTop = Math.max(0, Number(snapshot.scrollTop) || 0);
+  state.timelineShouldFollowLatest = false;
 }
 
 function autoGrowTextarea(textarea) {
+  if (!textarea?.style) return;
   textarea.style.height = "auto";
-  textarea.style.height = `${Math.min(160, Math.max(44, textarea.scrollHeight))}px`;
+  const nextHeight = `${Math.min(160, Math.max(44, textarea.scrollHeight || 44))}px`;
+  if (textarea.style.height !== nextHeight) textarea.style.height = nextHeight;
 }
 
 function updateSendButton() {
   const button = document.querySelector(".send-btn");
   if (button) button.disabled = !state.prompt.trim();
+  const queueButton = document.querySelector("#queue-message-button");
+  if (queueButton) queueButton.disabled = !state.prompt.trim();
 }
 
 function normalizeSiteTitle(value) {
   const title = String(value || "").trim();
-  return title || "Codex";
+  return title || "Codex 远程工作台";
 }
 
 function translate(value) {
@@ -2303,6 +3492,12 @@ function translate(value) {
 
 function firstLine(value) {
   return String(value || "").split(/\r?\n/u)[0].trim();
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value || "").replace(/\s+/gu, " ").trim();
+  if (!Number.isFinite(maxLength) || text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }
 
 function cwdLeafName(value) {
@@ -2395,6 +3590,13 @@ function icon(name) {
     doc: '<svg viewBox="0 0 24 24"><path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M9 13h6"/><path d="M9 17h6"/></svg>',
     share: '<svg viewBox="0 0 24 24"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7"/><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/></svg>',
     info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>',
+    panel: '<svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M10 3v18"/></svg>',
+    grid: '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M17 14v6"/><path d="M14 17h6"/></svg>',
+    sparkles: '<svg viewBox="0 0 24 24"><path d="m12 3 1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="m19 14 .8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8z"/><path d="m5 13 .8 2.2L8 16l-2.2.8L5 19l-.8-2.2L2 16l2.2-.8z"/></svg>',
+    clipboard: '<svg viewBox="0 0 24 24"><rect x="6" y="5" width="12" height="16" rx="2"/><path d="M9 5a3 3 0 0 1 6 0"/><path d="M9 12h6"/><path d="M9 16h4"/></svg>',
+    layers: '<svg viewBox="0 0 24 24"><path d="m12 3 9 4-9 4-9-4z"/><path d="m3 12 9 4 9-4"/><path d="m3 17 9 4 9-4"/></svg>',
+    check: '<svg viewBox="0 0 24 24"><path d="M9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>',
+    download: '<svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>',
   };
   return icons[name] || icons.info;
 }

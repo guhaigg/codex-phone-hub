@@ -1,7 +1,7 @@
 {
-  "name": "Codex Web",
-  "short_name": "Codex",
-  "description": "Self-hosted mobile console for local Codex control.",
+  "name": "Codex 远程工作台",
+  "short_name": "Codex 工作台",
+  "description": "手机和浏览器里的 Codex CLI 与桌面端远程工作台。",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -20,7 +20,7 @@
     "build": "tsc -p tsconfig.json",
     "serve": "node --conditions=development --import tsx src/cli.ts serve",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test test/auth_store.test.ts test/cli.test.ts test/config.test.ts test/event_bus.test.ts test/events.test.ts test/hybrid_auth_store.test.ts test/identity_store.test.ts test/install_docs.test.ts test/launchd_scripts.test.ts test/report_store.test.ts test/runtime_resolution.test.ts test/runtime.test.ts test/server_auth.test.ts test/server_multi_user.test.ts test/session_settings_store.test.ts",
+    "test": "tsx --test test/auth_store.test.ts test/active_turn_store.test.ts test/cli.test.ts test/config.test.ts test/event_bus.test.ts test/workspace_event_bus.test.ts test/events.test.ts test/hybrid_auth_store.test.ts test/identity_store.test.ts test/install_docs.test.ts test/launchd_scripts.test.ts test/remote_commands.test.ts test/report_store.test.ts test/runtime_resolution.test.ts test/runtime.test.ts test/server_auth.test.ts test/server_multi_user.test.ts test/session_settings_store.test.ts",
     "test:ui": "tsx --test test/public_ui.test.ts"
   },
   "dependencies": {

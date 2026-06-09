@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { FileIdentityStore } from '../src/identity_store.js';
 import { createCodexWebServer } from '../src/server.js';
+import { CodexWebWorkspaceEventBus } from '../src/workspace_event_bus.js';
 
 interface TestConfig {
   host: string;
@@ -186,6 +187,63 @@ test('POST /api/sessions/:sessionId/attachments falls back to state storage when
   } finally {
     await server.stop();
     await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/sessions/:sessionId/workspace/status reads the session cwd', async () => {
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-workspace-route-'));
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({ id: 'thread_1', cwd: projectDir }),
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/sessions/thread_1/workspace/status`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+
+    assert.equal(response.status, 200);
+    const payload = await response.json() as any;
+    assert.equal(payload.status.cwd, projectDir);
+    assert.equal(payload.status.exists, true);
+    assert.equal(payload.status.isGitRepository, false);
+  } finally {
+    await server.stop();
+    await fs.rm(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/sessions/:sessionId/workspace/files rejects path traversal', async () => {
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-workspace-route-'));
+  await fs.writeFile(path.join(projectDir, 'safe.txt'), 'safe');
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({ id: 'thread_1', cwd: projectDir }),
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const safe = await fetch(`${server.baseUrl}/api/sessions/thread_1/workspace/files?path=safe.txt`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(safe.status, 200);
+    assert.equal(((await safe.json()) as any).file.content, 'safe');
+
+    const rejected = await fetch(`${server.baseUrl}/api/sessions/thread_1/workspace/files?path=../outside.txt`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(rejected.status, 403);
+    assert.equal(((await rejected.json()) as any).error, 'workspace_path_forbidden');
+  } finally {
+    await server.stop();
+    await fs.rm(projectDir, { recursive: true, force: true });
   }
 });
 
@@ -855,6 +913,67 @@ test('POST /api/sessions/:id/turns returns 409 when the session already has an a
   }
 });
 
+test('POST /api/turns/:turnId/steer forwards steering input to the runtime', async () => {
+  const steerCalls: any[] = [];
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      steerTurn: async (turnId: string, input: any) => {
+        steerCalls.push({ turnId, input });
+        return { ok: true };
+      },
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/turns/turn_1/steer`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer cw_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Add more detail' }),
+    });
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { ok: true });
+    assert.deepEqual(steerCalls, [{
+      turnId: 'turn_1',
+      input: { text: 'Add more detail' },
+    }]);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('POST /api/turns/:turnId/steer returns 409 when steering is unsupported', async () => {
+  const error = new Error('This Codex runtime does not support steering a running turn.') as Error & { code?: string };
+  error.code = 'steer_not_supported';
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      steerTurn: async () => {
+        throw error;
+      },
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/turns/turn_1/steer`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer cw_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Add more detail' }),
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      error: 'steer_not_supported',
+      message: 'This Codex runtime does not support steering a running turn.',
+    });
+  } finally {
+    await server.stop();
+  }
+});
+
 test('POST /api/sessions/:id/turns returns handled slash command results', async () => {
   const server = createCodexWebServer({
     auth: createAcceptingAuth(),
@@ -1000,6 +1119,91 @@ test('POST /api/sessions/:id/turns returns handled slash command results', async
         ],
       },
     });
+  } finally {
+    await server.stop();
+  }
+});
+
+test('POST /api/sessions/:id/turns returns remote commands without turn lifecycle events', async () => {
+  const workspaceEvents = new CodexWebWorkspaceEventBus();
+  let subscribeToTurnCalls = 0;
+  const commandNames = new Map([
+    ['/status', 'status'],
+    ['/model gpt-5.5', 'model'],
+    ['/permissions read-only', 'permissions'],
+    ['/plan Build workspace inspector', 'plan'],
+    ['/resume thread_existing', 'resume'],
+    ['/fork thread_existing', 'fork'],
+    ['/mcp', 'mcp'],
+    ['/skills', 'skills'],
+    ['/plugins', 'plugins'],
+  ]);
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      startTurn: async (sessionId: string, input: { text: string }) => {
+        const name = commandNames.get(input.text) ?? 'unknown';
+        return {
+          type: 'command',
+          command: {
+            name,
+            action: name === 'fork' ? 'unsupported' : name === 'resume' ? 'resume' : 'show',
+            message: `${name} command handled`,
+            ...(name === 'plan' ? { draftPrompt: 'Build workspace inspector' } : {}),
+            goal: null,
+          },
+          session: {
+            id: sessionId,
+            cwd: '/repo',
+            title: 'Remote command thread',
+            updatedAt: 1,
+            preview: input.text,
+            firstUserInput: input.text,
+            lastUserInput: input.text,
+            lastInputAt: 1,
+            favorite: false,
+            favoriteOrder: null,
+            settings: name === 'plan' ? { collaborationMode: 'plan' } : {},
+            thread: { threadId: sessionId, cwd: '/repo', title: 'Remote command thread', turns: [] },
+            timeline: [
+              { id: `command_user_${name}`, kind: 'message', role: 'user', label: 'You', meta: 'command', text: input.text },
+              { id: `command_system_${name}`, kind: 'message', role: 'system', label: `/${name}`, meta: 'show', text: `${name} command handled` },
+            ],
+          },
+        };
+      },
+      subscribeToTurn: () => {
+        subscribeToTurnCalls += 1;
+        return () => {};
+      },
+    } as any,
+    config: createConfig(),
+    workspaceEvents,
+  });
+  await server.start();
+  try {
+    for (const text of commandNames.keys()) {
+      const response = await fetch(`${server.baseUrl}/api/sessions/thread_remote/turns`, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer cw_token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text }),
+      });
+      assert.equal(response.status, 202);
+      const payload = await response.json();
+      assert.equal(payload.type, 'command');
+      assert.equal(payload.command.name, commandNames.get(text));
+      assert.equal(payload.session.id, 'thread_remote');
+    }
+
+    assert.equal(subscribeToTurnCalls, 0);
+    assert.deepEqual(
+      workspaceEvents.list().map((entry) => entry.event.type),
+      Array.from(commandNames.keys(), () => 'session.updated'),
+    );
   } finally {
     await server.stop();
   }
@@ -1607,6 +1811,264 @@ test('SSE route accepts bearer auth and streams events', async () => {
     assert.equal(unsubscribeCalled, true);
   } finally {
     await server.stop();
+  }
+});
+
+test('SSE route replays only events after the requested sequence', async () => {
+  let capturedAfterId: string | number | null | undefined;
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      getTurnEvents: (_turnId: string, afterId?: string | number | null) => {
+        capturedAfterId = afterId;
+        return afterId === '41'
+          ? [
+            {
+              sequence: 42,
+              event: {
+                id: 'evt_42',
+                type: 'assistant.delta',
+                turnId: 'turn_1',
+                threadId: 'thread_1',
+                text: 'resumed',
+                phase: null,
+              },
+            },
+          ]
+          : [
+            {
+              sequence: 40,
+              event: {
+                id: 'evt_40',
+                type: 'turn.started',
+                turnId: 'turn_1',
+                threadId: 'thread_1',
+              },
+            },
+            {
+              sequence: 42,
+              event: {
+                id: 'evt_42',
+                type: 'assistant.delta',
+                turnId: 'turn_1',
+                threadId: 'thread_1',
+                text: 'resumed',
+                phase: null,
+              },
+            },
+          ];
+      },
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/turns/turn_1/events?after=41`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body?.getReader();
+    assert.ok(reader);
+    const firstChunk = await reader!.read();
+    const text = new TextDecoder().decode(firstChunk.value);
+    assert.equal(capturedAfterId, '41');
+    assert.match(text, /evt_42/);
+    assert.doesNotMatch(text, /evt_40/);
+    await reader!.cancel();
+  } finally {
+    await server.stop();
+  }
+});
+
+test('workspace SSE route rejects missing bearer token', async () => {
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: createRuntimeStub() as any,
+    config: createConfig(),
+    workspaceEvents: new CodexWebWorkspaceEventBus(),
+  } as any);
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/workspace/events`);
+    assert.equal(response.status, 401);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('workspace SSE route replays only events after the requested sequence', async () => {
+  const workspaceEvents = new CodexWebWorkspaceEventBus();
+  workspaceEvents.append({ type: 'session.created', sessionId: 'thread_1', threadId: 'thread_1' });
+  workspaceEvents.append({ type: 'turn.started', sessionId: 'thread_1', threadId: 'thread_1', turnId: 'turn_1' });
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: createRuntimeStub() as any,
+    config: createConfig(),
+    workspaceEvents,
+  } as any);
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/workspace/events?after=1`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type') ?? '', /^text\/event-stream\b/i);
+    const reader = response.body?.getReader();
+    assert.ok(reader);
+    const firstChunk = await reader!.read();
+    const text = new TextDecoder().decode(firstChunk.value);
+    assert.match(text, /turn.started/u);
+    assert.doesNotMatch(text, /session.created/u);
+    assert.match(text, /^id: 2/mu);
+    await reader!.cancel();
+  } finally {
+    await server.stop();
+  }
+});
+
+test('single-user session mutations append workspace events', async () => {
+  const workspaceEvents = new CodexWebWorkspaceEventBus();
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: createRuntimeStub() as any,
+    config: createConfig(),
+    workspaceEvents,
+  } as any);
+  await server.start();
+  try {
+    const create = await fetch(`${server.baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer cw_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'New session' }),
+    });
+    assert.equal(create.status, 201);
+
+    const favorite = await fetch(`${server.baseUrl}/api/sessions/thread_1/favorite`, {
+      method: 'PATCH',
+      headers: { Authorization: 'Bearer cw_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ favorite: true }),
+    });
+    assert.equal(favorite.status, 200);
+
+    const archive = await fetch(`${server.baseUrl}/api/sessions/thread_1/archive`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(archive.status, 200);
+
+    assert.deepEqual(workspaceEvents.list().map((entry) => entry.event.type), [
+      'session.created',
+      'session.favorite.updated',
+      'session.archived',
+    ]);
+    assert.deepEqual(workspaceEvents.list().map((entry) => entry.event.sessionId), ['thread_1', 'thread_1', 'thread_1']);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('single-user turn lifecycle events are mirrored to workspace events', async () => {
+  const workspaceEvents = new CodexWebWorkspaceEventBus();
+  let turnListener: ((entry: any) => void) | null = null;
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      startTurn: async () => ({ turnId: 'turn_1' }),
+      subscribeToTurn: (_turnId: string, listener: (entry: any) => void) => {
+        turnListener = listener;
+        return () => {};
+      },
+    } as any,
+    config: createConfig(),
+    workspaceEvents,
+  } as any);
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/sessions/thread_1/turns`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer cw_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Run checks' }),
+    });
+    assert.equal(response.status, 202);
+    assert.equal(typeof turnListener, 'function');
+
+    turnListener?.({
+      sequence: 5,
+      event: {
+        id: 'approval_1',
+        type: 'approval.requested',
+        turnId: 'turn_1',
+        approvalId: 'approval_1',
+        approvalKind: 'exec',
+        summary: { command: 'npm test' },
+      },
+    });
+    turnListener?.({
+      sequence: 6,
+      event: {
+        id: 'approval_1_resolved',
+        type: 'approval.resolved',
+        turnId: 'turn_1',
+        approvalId: 'approval_1',
+        decision: 'accepted',
+      },
+    });
+    turnListener?.({
+      sequence: 7,
+      event: {
+        id: 'completed_1',
+        type: 'turn.completed',
+        turnId: 'turn_1',
+        threadId: 'thread_1',
+        status: 'completed',
+      },
+    });
+
+    assert.deepEqual(workspaceEvents.list().map((entry) => entry.event.type), [
+      'turn.started',
+      'session.updated',
+      'approval.requested',
+      'approval.resolved',
+      'turn.completed',
+      'session.updated',
+    ]);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('report favorite updates append report workspace events', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-report-workspace-'));
+  const reportsDir = path.join(stateDir, 'reports');
+  await fs.mkdir(path.join(reportsDir, 'project-a'), { recursive: true });
+  await fs.writeFile(path.join(reportsDir, 'project-a', 'summary.md'), '# Summary\n', 'utf8');
+  const workspaceEvents = new CodexWebWorkspaceEventBus();
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: createRuntimeStub() as any,
+    config: createConfig({ stateDir, reportsDir, reportIndexPath: path.join(stateDir, 'report-index.json') }),
+    workspaceEvents,
+  } as any);
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/reports/project-a%2Fsummary.md/favorite`, {
+      method: 'PATCH',
+      headers: { Authorization: 'Bearer cw_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ favorite: true }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(workspaceEvents.list().map((entry) => ({
+      type: entry.event.type,
+      reportId: entry.event.reportId,
+    })), [{
+      type: 'report.updated',
+      reportId: 'project-a/summary.md',
+    }]);
+  } finally {
+    await server.stop();
+    await fs.rm(stateDir, { recursive: true, force: true });
   }
 });
 

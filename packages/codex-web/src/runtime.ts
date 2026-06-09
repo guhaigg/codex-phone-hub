@@ -21,6 +21,10 @@ import {
   resolveCodexHome,
 } from '@codex-phone-hub/codex-native-api';
 import { CodexWebEventBus } from './event_bus.js';
+import type {
+  CodexWebActiveTurnRecord,
+  CodexWebActiveTurnStore,
+} from './active_turn_store.js';
 import {
   createBatchCompletedEvent,
   isTerminalProviderTurnResult,
@@ -43,6 +47,15 @@ import type {
   CodexWebSessionTimelineStore,
   CodexWebTimelineMessage,
 } from './session_timeline_store.js';
+import {
+  createGoalCommandResult,
+  createHelpCommandResult,
+  createSimpleCommandResult,
+  formatGoalMessage,
+  parseRemoteCommand,
+  type CodexWebCommandResult as RemoteCommandResult,
+  type ParsedRemoteCommand,
+} from './remote_commands.js';
 
 interface CodexWebRuntimeLogger {
   debug?: (message: string) => void;
@@ -65,6 +78,8 @@ export interface CodexWebSession {
   favoriteOrder: number | null;
   goal: ProviderThreadGoal | null;
   activeTurnId: string | null;
+  activeTurnRecoverable: boolean;
+  lastKnownTurnStatus: string | null;
   settings: CodexWebStoredSessionSettings;
   thread: ProviderThreadSummary;
   timeline: CodexWebTimelineMessage[];
@@ -127,6 +142,12 @@ export interface CodexWebRuntimeClient {
     onApprovalRequest?: ((request: ProviderApprovalRequest) => Promise<void> | void) | null;
     timeoutMs?: number;
   }): Promise<ProviderTurnResult>;
+  steerTurn?(args: {
+    threadId: string;
+    turnId: string;
+    inputText: string;
+    input?: CodexTurnInput[] | null;
+  }): Promise<void>;
   interruptTurn(args: { threadId: string; turnId: string }): Promise<void>;
   respondToApproval(args: { requestId: string; option: 1 | 2 | 3 }): Promise<void>;
 }
@@ -136,6 +157,7 @@ export interface CodexWebRuntimeOptions {
   defaultCwd: string;
   client?: CodexWebRuntimeClient;
   eventBus?: CodexWebEventBus;
+  activeTurnStore?: CodexWebActiveTurnStore;
   settingsStore?: CodexWebSessionSettingsStore;
   timelineStore?: CodexWebSessionTimelineStore;
   helpReportPath?: string | null;
@@ -179,16 +201,9 @@ export interface AppendSessionTimelineEntryInput {
   afterHistoryIndex?: number | null;
 }
 
-export interface CodexWebCommandResult {
-  type: 'command';
-  command: {
-    name: 'goal' | 'help';
-    action: 'show' | 'set' | 'pause' | 'resume' | 'clear';
-    message: string;
-    goal: ProviderThreadGoal | null;
-  };
+export type CodexWebCommandResult = RemoteCommandResult & {
   session?: CodexWebSession | null;
-}
+};
 
 export type CodexWebStartTurnResult = { turnId: string } | CodexWebCommandResult;
 
@@ -213,6 +228,8 @@ export class CodexWebRuntime {
 
   private readonly timelineStore: CodexWebSessionTimelineStore | null;
 
+  private readonly activeTurnStore: CodexWebActiveTurnStore | null;
+
   private readonly sessionSettings = new Map<string, CodexWebStoredSessionSettings>();
 
   private readonly turnToThread = new Map<string, string>();
@@ -235,6 +252,7 @@ export class CodexWebRuntime {
     logger = createStderrLogger({ envVar: 'CODEX_WEB_DEBUG' }),
     client = new CodexAppClient({ codexCliBin: codexBin, logger }),
     eventBus = new CodexWebEventBus(),
+    activeTurnStore,
     settingsStore,
     timelineStore,
     helpReportPath = null,
@@ -242,6 +260,7 @@ export class CodexWebRuntime {
     this.client = client;
     this.eventBus = eventBus;
     this.defaultCwd = defaultCwd;
+    this.activeTurnStore = activeTurnStore ?? null;
     this.settingsStore = settingsStore ?? null;
     this.timelineStore = timelineStore ?? null;
     this.helpReportPath = helpReportPath;
@@ -466,24 +485,14 @@ export class CodexWebRuntime {
     if (!session) {
       throw new Error(`Unknown session: ${sessionId}`);
     }
-    const helpCommand = parseHelpSlashCommand(input.text);
-    if (helpCommand) {
+    const remoteCommand = parseRemoteCommand(input.text);
+    if (remoteCommand) {
       await this.ensureThreadReadyForTurn(sessionId);
-      const result = createHelpCommandResult(this.helpReportPath);
+      const result = await this.handleRemoteCommand(sessionId, session, remoteCommand);
       this.appendCommandTimeline(sessionId, input.text, result.command, timelineMessagesFromThread(session.thread).length);
       return {
         ...result,
-        session: await this.readSession(sessionId),
-      };
-    }
-    const goalCommand = parseGoalSlashCommand(input.text);
-    if (goalCommand) {
-      await this.ensureThreadReadyForTurn(sessionId);
-      const result = await this.handleGoalCommand(sessionId, goalCommand);
-      this.appendCommandTimeline(sessionId, input.text, result.command, timelineMessagesFromThread(session.thread).length);
-      return {
-        ...result,
-        session: await this.readSession(sessionId),
+        session: result.session ?? await this.readSession(sessionId),
       };
     }
     const conflictingTurnId = this.conflictingActiveTurnId(session);
@@ -518,6 +527,14 @@ export class CodexWebRuntime {
       }
       startedTurnId = turnId;
       this.turnToThread.set(turnId, sessionId);
+      this.activeTurnStore?.upsert({
+        turnId,
+        threadId: sessionId,
+        startedAt: Date.now(),
+        lastEventSequence: null,
+        lastKnownStatus: 'running',
+        pendingApprovalIds: [],
+      });
       this.append(turnId, normalizeTurnStartedEvent({
         turnId,
         threadId: sessionId,
@@ -657,9 +674,55 @@ export class CodexWebRuntime {
     return startedPromise;
   }
 
+  private async handleRemoteCommand(
+    sessionId: string,
+    session: CodexWebSession,
+    command: ParsedRemoteCommand,
+  ): Promise<CodexWebCommandResult> {
+    if (command.name === 'help') {
+      return createHelpCommandResult(this.helpReportPath) as CodexWebCommandResult;
+    }
+    if (command.name === 'goal') {
+      return this.handleGoalCommand(sessionId, command);
+    }
+    if (command.name === 'status') {
+      return this.handleStatusCommand(sessionId, session);
+    }
+    if (command.name === 'model') {
+      return this.handleModelCommand(sessionId, command);
+    }
+    if (command.name === 'permissions') {
+      return this.handlePermissionsCommand(sessionId, command);
+    }
+    if (command.name === 'plan') {
+      return this.handlePlanCommand(sessionId, command);
+    }
+    if (command.name === 'resume') {
+      return this.handleResumeCommand(command);
+    }
+    if (command.name === 'fork') {
+      return createSimpleCommandResult({
+        name: 'fork',
+        action: 'unsupported',
+        message: '当前 Codex runtime 还不支持从 Web fork thread。',
+      }) as CodexWebCommandResult;
+    }
+    if (command.name === 'mcp' || command.name === 'skills' || command.name === 'plugins') {
+      return createSimpleCommandResult({
+        name: command.name,
+        message: `${command.name} 摘要接口将在生态管理模块接入。`,
+      }) as CodexWebCommandResult;
+    }
+    return createSimpleCommandResult({
+      name: 'unknown',
+      action: 'unsupported',
+      message: `不支持的远程命令：${command.command || '/'}`,
+    }) as CodexWebCommandResult;
+  }
+
   private async handleGoalCommand(
     sessionId: string,
-    command: ParsedGoalSlashCommand,
+    command: ParsedRemoteCommand,
   ): Promise<CodexWebCommandResult> {
     if (command.action === 'show') {
       const goal = await this.requireGoalReader()(sessionId);
@@ -716,6 +779,145 @@ export class CodexWebRuntime {
     });
   }
 
+  private async handleStatusCommand(
+    sessionId: string,
+    session: CodexWebSession,
+  ): Promise<CodexWebCommandResult> {
+    const settings = this.getSessionSettings(sessionId);
+    let usageStatus = 'unavailable';
+    try {
+      const usage = await this.readUsage();
+      usageStatus = usage ? 'available' : 'unavailable';
+      const planType = isRecord(usage) && typeof usage.planType === 'string' ? usage.planType : '';
+      if (planType) {
+        usageStatus = planType;
+      }
+    } catch {
+      usageStatus = 'unavailable';
+    }
+    const active = this.activeTurnStateForThread(sessionId, session.thread);
+    const goal = typeof this.client.getThreadGoal === 'function'
+      ? await this.client.getThreadGoal(sessionId).catch(() => null)
+      : session.goal;
+    return createSimpleCommandResult({
+      name: 'status',
+      message: [
+        `Thread: ${sessionId}`,
+        `cwd: ${session.cwd || this.defaultCwd}`,
+        `model: ${settings.model || '默认模型'}`,
+        `reasoning: ${settings.reasoningEffort || 'medium'}`,
+        `sandbox: ${settings.sandboxMode || 'danger-full-access'}`,
+        `approval: ${settings.approvalPolicy || 'never'}`,
+        `collaboration: ${settings.collaborationMode || 'default'}`,
+        `personality: ${settings.personality || 'pragmatic'}`,
+        `activeTurn: ${active?.turnId || 'none'}`,
+        `goal: ${goal ? `${goal.status || 'active'} - ${goal.objective}` : 'none'}`,
+        `providerUsage: ${usageStatus}`,
+      ].join('\n'),
+    }) as CodexWebCommandResult;
+  }
+
+  private async handleModelCommand(
+    sessionId: string,
+    command: ParsedRemoteCommand,
+  ): Promise<CodexWebCommandResult> {
+    if (command.action === 'set' && command.model) {
+      const settings = this.mergeSettings(sessionId, { model: command.model });
+      this.persistSessionSettings(sessionId, settings);
+      return {
+        ...createSimpleCommandResult({
+          name: 'model',
+          action: 'set',
+          message: `Model set: ${command.model}`,
+        }),
+        session: await this.readSession(sessionId),
+      } as CodexWebCommandResult;
+    }
+    const settings = this.getSessionSettings(sessionId);
+    return createSimpleCommandResult({
+      name: 'model',
+      message: `Current model: ${settings.model || '默认模型'}`,
+    }) as CodexWebCommandResult;
+  }
+
+  private async handlePermissionsCommand(
+    sessionId: string,
+    command: ParsedRemoteCommand,
+  ): Promise<CodexWebCommandResult> {
+    if (command.action === 'set') {
+      const patch = permissionPatchForCommand(command);
+      if (!patch) {
+        return createSimpleCommandResult({
+          name: 'permissions',
+          action: 'unsupported',
+          message: `不支持的权限命令：${command.command || '/permissions'}`,
+        }) as CodexWebCommandResult;
+      }
+      const settings = this.mergeSettings(sessionId, patch);
+      this.persistSessionSettings(sessionId, settings);
+      return {
+        ...createSimpleCommandResult({
+          name: 'permissions',
+          action: 'set',
+          message: [
+            `Permissions set: ${settings.accessPreset || 'custom'}`,
+            `sandbox: ${settings.sandboxMode || 'danger-full-access'}`,
+            `approval: ${settings.approvalPolicy || 'never'}`,
+          ].join('\n'),
+        }),
+        session: await this.readSession(sessionId),
+      } as CodexWebCommandResult;
+    }
+    const settings = this.getSessionSettings(sessionId);
+    return createSimpleCommandResult({
+      name: 'permissions',
+      message: [
+        `preset: ${settings.accessPreset || 'full-access'}`,
+        `sandbox: ${settings.sandboxMode || 'danger-full-access'}`,
+        `approval: ${settings.approvalPolicy || 'never'}`,
+      ].join('\n'),
+    }) as CodexWebCommandResult;
+  }
+
+  private async handlePlanCommand(
+    sessionId: string,
+    command: ParsedRemoteCommand,
+  ): Promise<CodexWebCommandResult> {
+    const settings = this.mergeSettings(sessionId, { collaborationMode: 'plan' });
+    this.persistSessionSettings(sessionId, settings);
+    return {
+      ...createSimpleCommandResult({
+        name: 'plan',
+        action: 'switch',
+        message: command.text
+          ? `Plan mode enabled. Draft prompt: ${command.text}`
+          : 'Plan mode enabled for this session.',
+        ...(command.text ? { draftPrompt: command.text } : {}),
+      }),
+      session: await this.readSession(sessionId),
+    } as CodexWebCommandResult;
+  }
+
+  private async handleResumeCommand(command: ParsedRemoteCommand): Promise<CodexWebCommandResult> {
+    const threadId = command.threadId || '';
+    if (!threadId || typeof this.client.resumeThread !== 'function') {
+      return createSimpleCommandResult({
+        name: 'resume',
+        action: 'unsupported',
+        message: '当前 Codex runtime 不支持从 Web 恢复指定 thread。',
+      }) as CodexWebCommandResult;
+    }
+    await this.client.resumeThread({ threadId });
+    return {
+      ...createSimpleCommandResult({
+        name: 'resume',
+        action: 'resume',
+        message: `Resumed thread: ${threadId}`,
+      }),
+      session: await this.readSession(threadId),
+    } as CodexWebCommandResult;
+  }
+
   private requireGoalReader(): (threadId: string) => Promise<ProviderThreadGoal | null> {
     if (typeof this.client.getThreadGoal !== 'function') {
       throw new Error('Goal commands are not supported by this Codex runtime');
@@ -743,19 +945,43 @@ export class CodexWebRuntime {
   }
 
   async interruptTurn(turnId: string): Promise<void> {
-    const sessionId = this.turnToThread.get(turnId);
+    const sessionId = this.threadIdForTurn(turnId);
     if (!sessionId) {
       throw new Error(`Unknown turn: ${turnId}`);
     }
     await this.client.interruptTurn({ threadId: sessionId, turnId });
+    this.activeTurnStore?.update(turnId, { lastKnownStatus: 'interrupted' });
+  }
+
+  async steerTurn(turnId: string, input: StartTurnInput): Promise<{ ok: true }> {
+    const threadId = this.threadIdForTurn(turnId);
+    if (!threadId) {
+      throw new Error(`Unknown turn: ${turnId}`);
+    }
+    if (typeof this.client.steerTurn !== 'function') {
+      throw createSteerNotSupportedError();
+    }
+    const inputText = input.text;
+    await this.client.steerTurn({
+      threadId,
+      turnId,
+      inputText,
+      input: buildCodexTurnInput(inputText, input.attachments),
+    });
+    this.activeTurnStore?.update(turnId, { lastKnownStatus: 'steered' });
+    return { ok: true };
   }
 
   threadIdForTurn(turnId: string): string | null {
-    return this.turnToThread.get(turnId) ?? null;
+    return this.turnToThread.get(turnId)
+      ?? this.activeTurnStore?.get(turnId)?.threadId
+      ?? null;
   }
 
   threadIdForApproval(approvalId: string): string | null {
-    const turnId = this.approvalToTurn.get(approvalId);
+    const turnId = this.approvalToTurn.get(approvalId)
+      ?? this.activeTurnRecordForApproval(approvalId)?.turnId
+      ?? null;
     return turnId ? this.threadIdForTurn(turnId) : null;
   }
 
@@ -771,7 +997,9 @@ export class CodexWebRuntime {
     approvalId: string,
     decision: 'accept' | 'accept_for_session' | 'deny',
   ): Promise<void> {
-    const turnId = this.approvalToTurn.get(approvalId);
+    const turnId = this.approvalToTurn.get(approvalId)
+      ?? this.activeTurnRecordForApproval(approvalId)?.turnId
+      ?? null;
     if (!turnId) {
       throw new Error(`Unknown approval: ${approvalId}`);
     }
@@ -822,7 +1050,38 @@ export class CodexWebRuntime {
         event: summarizeRuntimeEvent(event),
       });
     }
-    this.eventBus.append(turnId, event);
+    const stored = this.eventBus.append(turnId, event);
+    this.updateActiveTurnStoreFromEvent(turnId, event, stored.sequence);
+  }
+
+  private updateActiveTurnStoreFromEvent(turnId: string, event: CodexWebEvent, sequence: number): void {
+    if (!this.activeTurnStore?.get(turnId)) {
+      return;
+    }
+    if (event.type === 'turn.completed' || event.type === 'turn.failed') {
+      this.activeTurnStore.markTerminal(turnId, event.type === 'turn.completed' ? event.status : 'failed');
+      return;
+    }
+    if (event.type === 'approval.requested') {
+      this.activeTurnStore.update(turnId, {
+        lastEventSequence: sequence,
+        lastKnownStatus: 'approval_pending',
+        addPendingApprovalId: event.approvalId,
+      });
+      return;
+    }
+    if (event.type === 'approval.resolved') {
+      this.activeTurnStore.update(turnId, {
+        lastEventSequence: sequence,
+        lastKnownStatus: 'running',
+        removePendingApprovalId: event.approvalId,
+      });
+      return;
+    }
+    this.activeTurnStore.update(turnId, {
+      lastEventSequence: sequence,
+      lastKnownStatus: event.type === 'turn.started' ? 'running' : this.activeTurnStore.get(turnId)?.lastKnownStatus ?? 'running',
+    });
   }
 
   private logDebug(event: string, payload: unknown = null): void {
@@ -931,6 +1190,7 @@ export class CodexWebRuntime {
     const current = this.getSessionSettings(thread.threadId);
     const updatedAt = thread.updatedAt ?? null;
     const inputSummary = summarizeSessionInputs(thread);
+    const activeTurn = this.activeTurnStateForThread(thread.threadId, thread);
     return {
       id: thread.threadId,
       cwd: thread.cwd,
@@ -944,7 +1204,9 @@ export class CodexWebRuntime {
       favorite: current.favorite === true,
       favoriteOrder: current.favoriteOrder ?? null,
       goal: null,
-      activeTurnId: this.activeTurnIdForThread(thread.threadId, thread),
+      activeTurnId: activeTurn?.turnId ?? null,
+      activeTurnRecoverable: activeTurn?.recoverable === true,
+      lastKnownTurnStatus: activeTurn?.lastKnownTurnStatus ?? null,
       settings: current,
       thread,
       timeline: composeSessionTimeline(thread, this.timelineStore?.list(thread.threadId) ?? []),
@@ -978,6 +1240,8 @@ export class CodexWebRuntime {
       favoriteOrder: settings.favoriteOrder ?? null,
       goal: null,
       activeTurnId: null,
+      activeTurnRecoverable: false,
+      lastKnownTurnStatus: null,
       settings,
       thread,
       timeline: this.timelineStore?.list(sessionId) ?? [],
@@ -985,20 +1249,60 @@ export class CodexWebRuntime {
   }
 
   private activeTurnIdForThread(threadId: string, thread: ProviderThreadSummary | null = null): string | null {
+    return this.activeTurnStateForThread(threadId, thread)?.turnId ?? null;
+  }
+
+  private processActiveTurnIdForThread(threadId: string): string | null {
     for (const [turnId] of this.activeTurns) {
       if (this.turnToThread.get(turnId) === threadId) {
-        if (thread && isTerminalThreadTurn(thread, turnId)) {
-          this.activeTurns.delete(turnId);
-          continue;
-        }
         return turnId;
       }
     }
     return null;
   }
 
+  private activeTurnStateForThread(
+    threadId: string,
+    thread: ProviderThreadSummary | null = null,
+  ): { turnId: string; recoverable: boolean; lastKnownTurnStatus: string | null } | null {
+    for (const [turnId] of this.activeTurns) {
+      if (this.turnToThread.get(turnId) !== threadId) {
+        continue;
+      }
+      if (thread && isTerminalThreadTurn(thread, turnId)) {
+        this.activeTurns.delete(turnId);
+        this.activeTurnStore?.markTerminal(turnId, 'terminal');
+        continue;
+      }
+      return {
+        turnId,
+        recoverable: false,
+        lastKnownTurnStatus: this.activeTurnStore?.get(turnId)?.lastKnownStatus ?? 'running',
+      };
+    }
+    const stored = this.activeTurnStore?.findByThreadId(threadId) ?? null;
+    if (!stored) {
+      return null;
+    }
+    if (thread && isTerminalThreadTurn(thread, stored.turnId)) {
+      this.activeTurnStore?.markTerminal(stored.turnId, 'terminal');
+      return null;
+    }
+    return {
+      turnId: stored.turnId,
+      recoverable: true,
+      lastKnownTurnStatus: stored.lastKnownStatus,
+    };
+  }
+
   private conflictingActiveTurnId(session: CodexWebSession): string | null {
-    return this.activeTurnIdForThread(session.id);
+    return this.processActiveTurnIdForThread(session.id);
+  }
+
+  private activeTurnRecordForApproval(approvalId: string): CodexWebActiveTurnRecord | null {
+    return this.activeTurnStore?.listActive()
+      .find((record) => record.pendingApprovalIds.includes(approvalId))
+      ?? null;
   }
 
   private async withThreadGoal(session: CodexWebSession): Promise<CodexWebSession> {
@@ -1214,68 +1518,35 @@ function summarizeSessionInputText(text: string | null | undefined): string | nu
   return `${normalized.slice(0, SESSION_INPUT_PREVIEW_MAX_LENGTH - 3).trimEnd()}...`;
 }
 
-interface ParsedGoalSlashCommand {
-  action: 'show' | 'set' | 'pause' | 'resume' | 'clear';
-  objective?: string;
-}
-
-function parseHelpSlashCommand(text: string): { action: 'show' } | null {
-  const normalized = String(text ?? '').trim();
-  if (normalized === '/help') {
-    return { action: 'show' };
+function permissionPatchForCommand(command: ParsedRemoteCommand): UpdateSessionSettingsInput | null {
+  if (command.preset === 'read-only') {
+    return {
+      accessPreset: 'read-only',
+      sandboxMode: 'read-only',
+      approvalPolicy: 'on-request',
+    };
+  }
+  if (command.preset === 'default') {
+    return {
+      accessPreset: 'default',
+      sandboxMode: 'workspace-write',
+      approvalPolicy: 'on-request',
+    };
+  }
+  if (command.preset === 'full-access') {
+    return {
+      accessPreset: 'full-access',
+      sandboxMode: 'danger-full-access',
+      approvalPolicy: 'never',
+    };
+  }
+  if (command.sandboxMode || command.approvalPolicy) {
+    return {
+      sandboxMode: command.sandboxMode ?? undefined,
+      approvalPolicy: command.approvalPolicy ?? undefined,
+    };
   }
   return null;
-}
-
-function parseGoalSlashCommand(text: string): ParsedGoalSlashCommand | null {
-  const normalized = String(text ?? '').trim();
-  if (!normalized.startsWith('/goal')) {
-    return null;
-  }
-  const afterCommand = normalized.slice('/goal'.length);
-  if (afterCommand && !/^\s/u.test(afterCommand)) {
-    return null;
-  }
-  const rest = afterCommand.trim();
-  if (!rest) {
-    return { action: 'show' };
-  }
-  const [firstToken = '', ...remaining] = rest.split(/\s+/u);
-  const keyword = firstToken.toLowerCase();
-  if (keyword === 'clear') {
-    return { action: 'clear' };
-  }
-  if (keyword === 'pause') {
-    return { action: 'pause' };
-  }
-  if (keyword === 'resume') {
-    return { action: 'resume' };
-  }
-  if (keyword === 'edit' || keyword === 'set') {
-    const objective = remaining.join(' ').trim();
-    return objective ? { action: 'set', objective } : { action: 'show' };
-  }
-  return { action: 'set', objective: rest };
-}
-
-function createGoalCommandResult({
-  action,
-  goal,
-  message,
-}: {
-  action: CodexWebCommandResult['command']['action'];
-  goal: ProviderThreadGoal | null;
-  message: string;
-}): CodexWebCommandResult {
-  return {
-    type: 'command',
-    command: {
-      name: 'goal',
-      action,
-      message,
-      goal,
-    },
-  };
 }
 
 function composeSessionTimeline(
@@ -1559,42 +1830,14 @@ function createTurnConflictError(sessionId: string, activeTurnId: string): Codex
   return error;
 }
 
+function createSteerNotSupportedError(): Error & { code: 'steer_not_supported' } {
+  const error = new Error('This Codex runtime does not support steering a running turn.') as Error & { code: 'steer_not_supported' };
+  error.code = 'steer_not_supported';
+  return error;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function createHelpCommandResult(helpReportPath: string | null): CodexWebCommandResult {
-  const guideLine = helpReportPath
-    ? `完整说明：[Codex Web 帮助文档](${helpReportPath})`
-    : '完整说明：请在 Reports 页面打开 Codex Web 帮助文档。';
-  return {
-    type: 'command',
-    command: {
-      name: 'help',
-      action: 'show',
-      message: [
-        '支持的命令：',
-        '- `/help` - 显示这份命令列表。',
-        '- `/goal` - 显示当前会话的目标。',
-        '- `/goal <objective>` - 设置当前会话目标。',
-        '- `/goal set <objective>` 或 `/goal edit <objective>` - 替换当前会话目标。',
-        '- `/goal pause` - 暂停当前目标。',
-        '- `/goal resume` - 恢复当前目标。',
-        '- `/goal clear` - 清除当前会话目标。',
-        '',
-        guideLine,
-      ].join('\n'),
-      goal: null,
-    },
-  };
-}
-
-function formatGoalMessage(goal: ProviderThreadGoal | null): string {
-  if (!goal) {
-    return 'No goal is set.';
-  }
-  const status = goal.status ? ` (${goal.status})` : '';
-  return `Goal${status}: ${goal.objective}`;
 }
 
 function summarizeRuntimeTurnResult(result: ProviderTurnResult): Record<string, unknown> {

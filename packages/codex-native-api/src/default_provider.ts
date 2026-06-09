@@ -222,6 +222,28 @@ export class DefaultCodexNativeProviderPlugin implements ProviderPluginContract 
     });
   }
 
+  async steerTurn({
+    providerProfile,
+    threadId,
+    turnId,
+    event,
+    inputText,
+  }: {
+    providerProfile: ProviderProfile;
+    threadId: string;
+    turnId: string;
+    event: ProviderTurnEvent;
+    inputText: string;
+  }): Promise<void> {
+    const client = await this.ensureClient(providerProfile);
+    await client.steerTurn({
+      threadId,
+      turnId,
+      inputText,
+      input: buildCodexTurnInput(event, inputText),
+    });
+  }
+
   async reconnectProfile({
     providerProfile,
   }: {

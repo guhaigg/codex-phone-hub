@@ -35,6 +35,17 @@ import type {
   StartTurnInput,
   UpdateSessionSettingsInput,
 } from './runtime.js';
+import {
+  CodexWebWorkspaceEventBus,
+  type CodexWebWorkspaceEventType,
+  type CodexWebStoredWorkspaceEvent,
+} from './workspace_event_bus.js';
+import {
+  WorkspaceInspectorError,
+  inspectWorkspaceDiff,
+  inspectWorkspaceFile,
+  inspectWorkspaceStatus,
+} from './workspace_inspector.js';
 
 export interface CodexWebAuthLike {
   isConfigured(): Promise<boolean>;
@@ -54,6 +65,7 @@ export interface CreateCodexWebServerOptions {
   config: CodexWebConfig;
   identityStore?: CodexWebIdentityStoreLike | null;
   staticFiles?: StaticFilesRecord;
+  workspaceEvents?: CodexWebWorkspaceEventBus;
 }
 
 export interface CodexWebServerHandle {
@@ -134,12 +146,20 @@ interface StoredUploadAttachment {
   displayPath: string;
 }
 
+interface WorkspaceEventSessionContext {
+  sessionId: string;
+  threadId: string;
+  projectId?: string | null;
+  ownerUserId?: string | null;
+}
+
 export function createCodexWebServer({
   auth,
   runtime,
   config,
   identityStore = null,
   staticFiles,
+  workspaceEvents = new CodexWebWorkspaceEventBus(),
 }: CreateCodexWebServerOptions): CodexWebServerHandle {
   const resolvedStaticFiles = staticFiles ?? loadDefaultStaticFiles();
   const activeSseClosers = new Set<() => void>();
@@ -158,6 +178,7 @@ export function createCodexWebServer({
       identityStore,
       staticFiles: resolvedStaticFiles,
       config,
+      workspaceEvents,
       loginRateLimiter,
       registerSseCloser: (close) => {
         activeSseClosers.add(close);
@@ -309,6 +330,7 @@ async function handleRequest({
   identityStore,
   staticFiles,
   config,
+  workspaceEvents,
   loginRateLimiter,
   registerSseCloser,
 }: {
@@ -319,6 +341,7 @@ async function handleRequest({
   identityStore: CodexWebIdentityStoreLike | null;
   staticFiles: StaticFilesRecord;
   config: CodexWebConfig;
+  workspaceEvents: CodexWebWorkspaceEventBus;
   loginRateLimiter: FixedWindowRateLimiter;
   registerSseCloser: (close: () => void) => () => void;
 }): Promise<void> {
@@ -425,6 +448,7 @@ async function handleRequest({
       identityState,
       runtime,
       config,
+      workspaceEvents,
       registerSseCloser,
     });
     if (handled) {
@@ -440,6 +464,17 @@ async function handleRequest({
   if (pathname === '/api/auth/logout' && method === 'POST') {
     await auth.logout(authContext.token);
     writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (pathname === '/api/workspace/events' && method === 'GET') {
+    await streamWorkspaceEvents({
+      request,
+      response,
+      workspaceEvents,
+      afterId: normalizeLastEventId(url.searchParams.get('after'), request.headers['last-event-id']),
+      registerSseCloser,
+    });
     return;
   }
 
@@ -529,7 +564,32 @@ async function handleRequest({
   if (pathname === '/api/sessions' && method === 'POST') {
     const body = await readJsonBody(request);
     const session = await runtime.createSession(body as CreateSessionInput);
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.created', singleUserWorkspaceContext(session.id));
     writeJson(response, 201, { session });
+    return;
+  }
+
+  const sessionWorkspaceMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/workspace\/(status|diff|files)$/u);
+  if (sessionWorkspaceMatch && method === 'GET') {
+    const session = await runtime.readSession(decodeURIComponent(sessionWorkspaceMatch[1]!));
+    if (!session) {
+      writeSessionNotFound(response);
+      return;
+    }
+    const cwd = normalizeOptionalString(session.cwd);
+    if (!cwd) {
+      writeJson(response, 404, {
+        error: 'workspace_not_found',
+        message: 'Session has no workspace cwd.',
+      });
+      return;
+    }
+    await writeWorkspaceInspectorResponse({
+      response,
+      cwd,
+      action: sessionWorkspaceMatch[2] as 'status' | 'diff' | 'files',
+      filePath: url.searchParams.get('path'),
+    });
     return;
   }
 
@@ -569,6 +629,7 @@ async function handleRequest({
       });
       return;
     }
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', singleUserWorkspaceContext(sessionId));
     writeJson(response, 201, { entry });
     return;
   }
@@ -579,17 +640,20 @@ async function handleRequest({
       writeSessionNotFound(response);
       return;
     }
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.archived', singleUserWorkspaceContext(decodeURIComponent(sessionMatch[1]!)));
     writeJson(response, 200, { ok: true });
     return;
   }
 
   const sessionArchiveMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/archive$/u);
   if (sessionArchiveMatch && method === 'POST') {
-    const archived = await runtime.archiveSession(decodeURIComponent(sessionArchiveMatch[1]!));
+    const sessionId = decodeURIComponent(sessionArchiveMatch[1]!);
+    const archived = await runtime.archiveSession(sessionId);
     if (!archived) {
       writeSessionNotFound(response);
       return;
     }
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.archived', singleUserWorkspaceContext(sessionId));
     writeJson(response, 200, { ok: true });
     return;
   }
@@ -608,6 +672,7 @@ async function handleRequest({
       writeSessionNotFound(response);
       return;
     }
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.favorite.updated', singleUserWorkspaceContext(sessionId));
     writeJson(response, 200, { session });
     return;
   }
@@ -621,6 +686,7 @@ async function handleRequest({
       writeSessionNotFound(response);
       return;
     }
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', singleUserWorkspaceContext(sessionId));
     writeJson(response, 200, { session });
     return;
   }
@@ -671,6 +737,11 @@ async function handleRequest({
     if (!report) {
       return;
     }
+    workspaceEvents.append({
+      type: 'report.updated',
+      reportId: report.id,
+      details: { favorite },
+    });
     writeJson(response, 200, { report });
     return;
   }
@@ -718,6 +789,12 @@ async function handleRequest({
     if (!turn) {
       return;
     }
+    mirrorStartedTurnToWorkspace({
+      runtime,
+      workspaceEvents,
+      context: singleUserWorkspaceContext(sessionId),
+      turn,
+    });
     writeJson(response, 202, turn);
     return;
   }
@@ -726,6 +803,26 @@ async function handleRequest({
   if (interruptMatch && method === 'POST') {
     await runtime.interruptTurn(decodeURIComponent(interruptMatch[1]!));
     writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  const steerMatch = pathname.match(/^\/api\/turns\/([^/]+)\/steer$/u);
+  if (steerMatch && method === 'POST') {
+    const body = await readJsonBody(request);
+    if (typeof body.text !== 'string' || !body.text.trim()) {
+      writeJson(response, 400, { error: 'text is required' });
+      return;
+    }
+    const steered = await steerTurnForResponse({
+      runtime,
+      turnId: decodeURIComponent(steerMatch[1]!),
+      input: body as unknown as StartTurnInput,
+      response,
+    });
+    if (!steered) {
+      return;
+    }
+    writeJson(response, 202, steered);
     return;
   }
 
@@ -778,7 +875,7 @@ function injectAppShellBootstrap(asset: StaticFileAsset, siteTitle: string): Sta
   let body = String(asset.body).replace(/<title>[^<]*<\/title>/iu, `<title>${escapeHtml(title)}</title>`);
   if (!body.includes('id="codex-web-bootstrap"')) {
     body = body.replace(
-      /(\s*<script type="module" src="\/app\.js"><\/script>)/u,
+      /(\s*<script type="module" src="\/app\.js(?:\?[^"]*)?"><\/script>)/u,
       `\n  ${bootstrap}$1`,
     );
   }
@@ -988,6 +1085,7 @@ async function handleMultiUserRequest({
   identityState,
   runtime,
   config,
+  workspaceEvents,
   registerSseCloser,
 }: {
   request: IncomingMessage;
@@ -1002,10 +1100,23 @@ async function handleMultiUserRequest({
   identityState: CodexWebIdentityState;
   runtime: CodexWebRuntime;
   config: CodexWebConfig;
+  workspaceEvents: CodexWebWorkspaceEventBus;
   registerSseCloser: (close: () => void) => () => void;
 }): Promise<boolean> {
   if (pathname === '/api/auth/me' || pathname === '/api/auth/logout') {
     return false;
+  }
+
+  if (pathname === '/api/workspace/events' && method === 'GET') {
+    await streamWorkspaceEvents({
+      request,
+      response,
+      workspaceEvents,
+      afterId: normalizeLastEventId(url.searchParams.get('after'), request.headers['last-event-id']),
+      registerSseCloser,
+      filter: (entry) => canReadWorkspaceEvent(identityState, principal, entry),
+    });
+    return true;
   }
 
   if (pathname === '/api/projects' && method === 'GET') {
@@ -1051,6 +1162,25 @@ async function handleMultiUserRequest({
       favorite: body.favorite,
     });
     writeJson(response, 200, { projectId: project.id, favorite: body.favorite });
+    return true;
+  }
+
+  const projectWorkspaceStatusMatch = pathname.match(/^\/api\/projects\/([^/]+)\/status$/u);
+  if (projectWorkspaceStatusMatch && method === 'GET') {
+    const projectId = decodeURIComponent(projectWorkspaceStatusMatch[1]!);
+    const project = findProject(identityState, projectId);
+    if (
+      !project
+      || (!principal.isAdmin && (project.enabled === false || !canReadProject(identityState, principal, project.id)))
+    ) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    await writeWorkspaceInspectorResponse({
+      response,
+      cwd: project.cwd,
+      action: 'status',
+    });
     return true;
   }
 
@@ -1160,6 +1290,7 @@ async function handleMultiUserRequest({
       archivedByUserId: null,
       archiveSource: null,
     });
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.created', appSessionWorkspaceContext(appSession));
     writeJson(response, 201, {
       session: presentSessionForUser({
         runtimeSession,
@@ -1268,6 +1399,31 @@ async function handleMultiUserRequest({
     return true;
   }
 
+  const sessionWorkspaceMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/workspace\/(status|diff|files)$/u);
+  if (sessionWorkspaceMatch && method === 'GET') {
+    const resolved = resolveReadableWorkspaceAppSession(identityState, principal, decodeURIComponent(sessionWorkspaceMatch[1]!));
+    if (!resolved) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    const runtimeSession = resolved.project?.cwd ? null : await runtime.readSession(resolved.appSession.codexThreadId);
+    const cwd = normalizeOptionalString(resolved.project?.cwd) || normalizeOptionalString(runtimeSession?.cwd);
+    if (!cwd) {
+      writeJson(response, 404, {
+        error: 'workspace_not_found',
+        message: 'Session has no workspace cwd.',
+      });
+      return true;
+    }
+    await writeWorkspaceInspectorResponse({
+      response,
+      cwd,
+      action: sessionWorkspaceMatch[2] as 'status' | 'diff' | 'files',
+      filePath: url.searchParams.get('path'),
+    });
+    return true;
+  }
+
   const sessionMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/u);
   if (sessionMatch && method === 'GET') {
     const resolved = resolveReadableWorkspaceAppSession(identityState, principal, decodeURIComponent(sessionMatch[1]!));
@@ -1319,6 +1475,7 @@ async function handleMultiUserRequest({
       archivedByUserId: principal.userId,
       archiveSource: 'codex',
     });
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.archived', appSessionWorkspaceContext(resolved.appSession));
     writeJson(response, 200, { ok: true });
     return true;
   }
@@ -1354,6 +1511,7 @@ async function handleMultiUserRequest({
         archivedByUserId: principal.userId,
         archiveSource: 'codex',
       });
+      appendWorkspaceSessionEvent(workspaceEvents, 'session.archived', appSessionWorkspaceContext(resolved.appSession));
       writeJson(response, 200, { ok: true });
       return true;
     }
@@ -1371,7 +1529,7 @@ async function handleMultiUserRequest({
       return true;
     }
     const now = new Date().toISOString();
-    await identityStore.upsertSession({
+    const updatedAppSession = await identityStore.upsertSession({
       ...resolved.appSession,
       updatedAt: now,
       archived: false,
@@ -1379,6 +1537,7 @@ async function handleMultiUserRequest({
       archivedByUserId: null,
       archiveSource: null,
     });
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.unarchived', appSessionWorkspaceContext(updatedAppSession));
     writeJson(response, 200, {
       session: presentSessionForUser({
         runtimeSession: unarchived,
@@ -1456,6 +1615,12 @@ async function handleMultiUserRequest({
       ...resolved.appSession,
       updatedAt: new Date().toISOString(),
     });
+    mirrorStartedTurnToWorkspace({
+      runtime,
+      workspaceEvents,
+      context: appSessionWorkspaceContext(resolved.appSession),
+      turn,
+    });
     writeJson(response, 202, turn);
     return true;
   }
@@ -1515,6 +1680,7 @@ async function handleMultiUserRequest({
       writeSessionNotFound(response);
       return true;
     }
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', appSessionWorkspaceContext(resolved.appSession));
     writeJson(response, 200, {
       session: presentSessionForUser({
         runtimeSession,
@@ -1544,6 +1710,36 @@ async function handleMultiUserRequest({
       await runtime.interruptTurn(turnId);
     }
     writeJson(response, 200, { ok: true });
+    return true;
+  }
+
+  const steerMatch = pathname.match(/^\/api\/turns\/([^/]+)\/steer$/u);
+  if (steerMatch && method === 'POST') {
+    const turnId = decodeURIComponent(steerMatch[1]!);
+    const threadId = runtime.threadIdForTurn?.(turnId);
+    const appSession = threadId ? identityState.sessions.find((session) => session.codexThreadId === threadId) : null;
+    if (!appSession || !canWriteResolvedAppSession(identityState, principal, appSession)) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    if (rejectArchivedSessionWrite(response, appSession)) {
+      return true;
+    }
+    const body = await readJsonBody(request);
+    if (typeof body.text !== 'string' || !body.text.trim()) {
+      writeJson(response, 400, { error: 'text is required' });
+      return true;
+    }
+    const steered = await steerTurnForResponse({
+      runtime,
+      turnId,
+      input: body as unknown as StartTurnInput,
+      response,
+    });
+    if (!steered) {
+      return true;
+    }
+    writeJson(response, 202, steered);
     return true;
   }
 
@@ -1944,6 +2140,33 @@ function findAppSessionByExternalId(state: CodexWebIdentityState, sessionId: str
     ?? null;
 }
 
+function canReadWorkspaceEvent(
+  state: CodexWebIdentityState,
+  principal: CodexWebPrincipal,
+  entry: CodexWebStoredWorkspaceEvent,
+): boolean {
+  const event = entry.event;
+  const sessionId = normalizeOptionalString(event.sessionId) || normalizeOptionalString(event.threadId);
+  if (sessionId) {
+    const appSession = findAppSessionByExternalId(state, sessionId);
+    if (appSession) {
+      return canReadWorkspaceAppSession(state, principal, appSession);
+    }
+    const ownerUserId = normalizeOptionalString(event.ownerUserId);
+    if (ownerUserId && ownerUserId !== principal.userId) {
+      return false;
+    }
+    const projectId = normalizeOptionalString(event.projectId);
+    return Boolean(ownerUserId && projectId && canReadProject(state, principal, projectId));
+  }
+  const projectId = normalizeOptionalString(event.projectId);
+  if (projectId) {
+    return canReadProject(state, principal, projectId);
+  }
+  const ownerUserId = normalizeOptionalString(event.ownerUserId);
+  return Boolean(ownerUserId && ownerUserId === principal.userId);
+}
+
 function findProject(state: CodexWebIdentityState, projectId: string): CodexWebProject | null {
   return state.projects.find((project) => project.id === projectId) ?? null;
 }
@@ -2327,6 +2550,149 @@ async function startSessionTurn({
     }
     throw error;
   }
+}
+
+async function steerTurnForResponse({
+  runtime,
+  turnId,
+  input,
+  response,
+}: {
+  runtime: CodexWebRuntime;
+  turnId: string;
+  input: StartTurnInput;
+  response: ServerResponse;
+}): Promise<{ ok: true } | null> {
+  try {
+    return await runtime.steerTurn(turnId, input);
+  } catch (error) {
+    if (isSteerNotSupportedError(error)) {
+      writeJson(response, 409, {
+        error: 'steer_not_supported',
+        message: error instanceof Error ? error.message : 'This Codex runtime does not support steering a running turn.',
+      });
+      return null;
+    }
+    if (isSessionNotFoundError(error) || /unknown turn/iu.test(error instanceof Error ? error.message : String(error))) {
+      writeSessionNotFound(response);
+      return null;
+    }
+    throw error;
+  }
+}
+
+function singleUserWorkspaceContext(sessionId: string): WorkspaceEventSessionContext {
+  return {
+    sessionId,
+    threadId: sessionId,
+  };
+}
+
+function appSessionWorkspaceContext(appSession: CodexWebAppSession): WorkspaceEventSessionContext {
+  return {
+    sessionId: appSession.id,
+    threadId: appSession.codexThreadId,
+    projectId: appSession.projectId,
+    ownerUserId: appSession.ownerUserId,
+  };
+}
+
+function appendWorkspaceSessionEvent(
+  workspaceEvents: CodexWebWorkspaceEventBus,
+  type: Extract<CodexWebWorkspaceEventType, `session.${string}`>,
+  context: WorkspaceEventSessionContext,
+  details: Record<string, unknown> | null = null,
+): void {
+  workspaceEvents.append({
+    type,
+    ...context,
+    details,
+  });
+}
+
+function mirrorStartedTurnToWorkspace({
+  runtime,
+  workspaceEvents,
+  context,
+  turn,
+}: {
+  runtime: CodexWebRuntime;
+  workspaceEvents: CodexWebWorkspaceEventBus;
+  context: WorkspaceEventSessionContext;
+  turn: CodexWebStartTurnResult;
+}): void {
+  if (!isStartedTurnResult(turn)) {
+    appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', context);
+    return;
+  }
+  const turnId = turn.turnId;
+  workspaceEvents.append({
+    type: 'turn.started',
+    ...context,
+    turnId,
+  });
+  appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', context);
+  let unsubscribe: (() => void) | null = null;
+  const cleanup = () => {
+    unsubscribe?.();
+    unsubscribe = null;
+  };
+  unsubscribe = runtime.subscribeToTurn(turnId, (entry) => {
+    const event = entry.event;
+    if (event.type === 'approval.requested') {
+      workspaceEvents.append({
+        type: 'approval.requested',
+        ...context,
+        turnId,
+        approvalId: event.approvalId,
+        details: {
+          approvalKind: event.approvalKind,
+          summary: event.summary,
+        },
+      });
+      return;
+    }
+    if (event.type === 'approval.resolved') {
+      workspaceEvents.append({
+        type: 'approval.resolved',
+        ...context,
+        turnId,
+        approvalId: event.approvalId,
+        status: event.decision,
+      });
+      return;
+    }
+    if (event.type === 'turn.completed') {
+      workspaceEvents.append({
+        type: 'turn.completed',
+        ...context,
+        turnId,
+        status: event.status,
+      });
+      appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', context);
+      cleanup();
+      return;
+    }
+    if (event.type === 'turn.failed') {
+      workspaceEvents.append({
+        type: 'turn.failed',
+        ...context,
+        turnId,
+        status: 'failed',
+        details: {
+          message: event.message,
+          details: event.details ?? null,
+        },
+      });
+      appendWorkspaceSessionEvent(workspaceEvents, 'session.updated', context);
+      cleanup();
+    }
+  });
+}
+
+function isStartedTurnResult(turn: CodexWebStartTurnResult): turn is { turnId: string } {
+  return typeof (turn as { turnId?: unknown }).turnId === 'string'
+    && Boolean((turn as { turnId: string }).turnId.trim());
 }
 
 async function projectCodexWebRuntimeContext({
@@ -2828,6 +3194,47 @@ function writeInvalidReportPath(response: ServerResponse, error: unknown): void 
   });
 }
 
+async function writeWorkspaceInspectorResponse({
+  response,
+  cwd,
+  action,
+  filePath,
+}: {
+  response: ServerResponse;
+  cwd: string;
+  action: 'status' | 'diff' | 'files';
+  filePath?: string | null;
+}): Promise<void> {
+  try {
+    if (action === 'status') {
+      writeJson(response, 200, { status: await inspectWorkspaceStatus(cwd) });
+      return;
+    }
+    if (action === 'diff') {
+      writeJson(response, 200, { diff: await inspectWorkspaceDiff(cwd) });
+      return;
+    }
+    const pathValue = normalizeOptionalString(filePath);
+    if (!pathValue) {
+      writeJson(response, 400, {
+        error: 'workspace_path_required',
+        message: 'path query parameter is required.',
+      });
+      return;
+    }
+    writeJson(response, 200, { file: await inspectWorkspaceFile(cwd, pathValue) });
+  } catch (error) {
+    if (error instanceof WorkspaceInspectorError) {
+      writeJson(response, error.status, {
+        error: error.code,
+        message: error.message,
+      });
+      return;
+    }
+    throw error;
+  }
+}
+
 function isInvalidReportPathError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /invalid report id|outside the reports directory|markdown or html/u.test(message);
@@ -2844,6 +3251,11 @@ function isSessionNotFoundError(error: unknown): boolean {
 function isTurnConflictError(error: unknown): boolean {
   return error instanceof Error
     && (error as Error & { code?: string }).code === 'turn_conflict';
+}
+
+function isSteerNotSupportedError(error: unknown): boolean {
+  return error instanceof Error
+    && (error as Error & { code?: string }).code === 'steer_not_supported';
 }
 
 function isUsernameConflictError(error: unknown): boolean {
@@ -2903,6 +3315,72 @@ async function streamTurnEvents({
   }
 
   const unsubscribe = runtime.subscribeToTurn(turnId, writeEvent);
+  const heartbeat = setInterval(() => {
+    response.write(': keepalive\n\n');
+  }, 15_000);
+  let closed = false;
+  let unregisterForcedClose: (() => void) | null = null;
+
+  const cleanup = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+    unregisterForcedClose?.();
+    unregisterForcedClose = null;
+    if (!response.writableEnded && !response.destroyed) {
+      response.end();
+    }
+  };
+
+  unregisterForcedClose = registerSseCloser(() => {
+    cleanup();
+    request.socket.destroy();
+  });
+
+  request.once('close', cleanup);
+  request.once('aborted', cleanup);
+  response.once('close', cleanup);
+  response.once('error', cleanup);
+}
+
+async function streamWorkspaceEvents({
+  request,
+  response,
+  workspaceEvents,
+  afterId,
+  registerSseCloser,
+  filter = () => true,
+}: {
+  request: IncomingMessage;
+  response: ServerResponse;
+  workspaceEvents: CodexWebWorkspaceEventBus;
+  afterId?: string | number | null;
+  registerSseCloser: (close: () => void) => () => void;
+  filter?: (entry: CodexWebStoredWorkspaceEvent) => boolean;
+}): Promise<void> {
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    Connection: 'keep-alive',
+  });
+
+  const writeEvent = (entry: CodexWebStoredWorkspaceEvent) => {
+    if (!filter(entry)) {
+      return;
+    }
+    response.write(`id: ${entry.sequence}\n`);
+    response.write('event: message\n');
+    response.write(`data: ${JSON.stringify(entry.event)}\n\n`);
+  };
+
+  for (const entry of workspaceEvents.list(afterId)) {
+    writeEvent(entry);
+  }
+
+  const unsubscribe = workspaceEvents.subscribe(writeEvent);
   const heartbeat = setInterval(() => {
     response.write(': keepalive\n\n');
   }, 15_000);

@@ -19,8 +19,8 @@ test('mobile UI exposes iOS PWA install metadata and registers a service worker'
   ]);
   const parsedManifest = JSON.parse(manifest);
 
-  assert.equal(parsedManifest.name, 'Codex Web');
-  assert.equal(parsedManifest.short_name, 'Codex');
+  assert.equal(parsedManifest.name, 'Codex 远程工作台');
+  assert.equal(parsedManifest.short_name, 'Codex 工作台');
   assert.equal(parsedManifest.display, 'standalone');
   assert.equal(parsedManifest.orientation, 'portrait-primary');
   assert.equal(parsedManifest.start_url, '/');
@@ -33,15 +33,20 @@ test('mobile UI exposes iOS PWA install metadata and registers a service worker'
   assert.match(index, /<meta name="screen-orientation" content="portrait">/u);
   assert.match(index, /<meta name="x5-orientation" content="portrait">/u);
   assert.match(index, /<meta name="apple-mobile-web-app-capable" content="yes">/u);
-  assert.match(index, /<meta name="apple-mobile-web-app-title" content="Codex">/u);
+  assert.match(index, /<meta name="apple-mobile-web-app-title" content="Codex 工作台">/u);
+  assert.match(index, /<link rel="stylesheet" href="\/styles\.css\?v=20260609-render-stability-fix1">/u);
+  assert.match(index, /<script type="module" src="\/app\.js\?v=20260609-render-stability-fix1"><\/script>/u);
   assert.deepEqual(parsedManifest.icons.map((icon) => icon.src), ['/icon-192.png', '/icon-512.png']);
   assert.deepEqual(parsedManifest.icons.map((icon) => icon.type), ['image/png', 'image/png']);
   assert.deepEqual(parsedManifest.icons.map((icon) => icon.sizes), ['192x192', '512x512']);
   assert.match(app, /navigator\.serviceWorker\.register\('\/service-worker\.js'\)/u);
-  assert.match(app, /const APP_BUILD_ID = '__CODEX_WEB_BUILD_ID__';/u);
-  assert.match(serviceWorker, /codex-web-static-__CODEX_WEB_BUILD_ID__/u);
+  assert.match(app, /const APP_BUILD_ID = ["']__CODEX_WEB_BUILD_ID__["'];/u);
+  assert.match(serviceWorker, /const ASSET_VERSION = '20260609-render-stability-fix1';/u);
+  assert.match(serviceWorker, /codex-web-static-\$\{ASSET_VERSION\}/u);
   assert.doesNotMatch(app, /runtime-status-v37/u);
   assert.doesNotMatch(serviceWorker, /runtime-status-v37/u);
+  assert.match(serviceWorker, /`\/styles\.css\?v=\$\{ASSET_VERSION\}`/u);
+  assert.match(serviceWorker, /`\/app\.js\?v=\$\{ASSET_VERSION\}`/u);
   assert.match(serviceWorker, /'\/icon-192\.png'/u);
   assert.match(serviceWorker, /'\/icon-512\.png'/u);
   assert.match(serviceWorker, /'\/apple-touch-icon\.png'/u);
@@ -60,6 +65,44 @@ test('PWA checks app version on foreground to escape stale standalone caches', a
   assert.match(app, /async function checkForAppUpdate\(\)/u);
   assert.match(app, /fetch\(`\/app\.js\?version-check=\$\{Date\.now\(\)\}`/u);
   assert.match(app, /window\.location\.reload\(\)/u);
+});
+
+test('local preview unregisters service workers so refresh cannot be trapped by stale app shells', async () => {
+  const app = await readFile(appUrl, 'utf8');
+
+  assert.match(app, /function isLocalPreviewHost\(\)/u);
+  assert.match(app, /navigator\.serviceWorker\.getRegistrations\(\)/u);
+  assert.match(app, /registration\.unregister\(\)/u);
+  assert.match(app, /if \(isLocalPreviewHost\(\)\) \{/u);
+});
+
+test('public UI copy is specific to Codex Remote Workbench and has no borrowed placeholders', async () => {
+  const [index, app, manifest] = await Promise.all([
+    readFile(indexUrl, 'utf8'),
+    readFile(appUrl, 'utf8'),
+    readFile(manifestUrl, 'utf8'),
+  ]);
+  const parsedManifest = JSON.parse(manifest);
+
+  assert.match(index, /<html lang="zh-CN">/u);
+  assert.equal(parsedManifest.name, 'Codex 远程工作台');
+  assert.match(app, /Codex 远程工作台/u);
+
+  const staleCopyPatterns = [
+    /新一代 AI 编程代理/u,
+    /移动 AI 编程代理/u,
+    /Reply\.\.\./u,
+    /admin@example\.com/u,
+    /placeholder="Operator"/u,
+    /placeholder="operator"/u,
+    /placeholder="auto or workday"/u,
+    /placeholder="workday"/u,
+    /placeholder="Workday"/u,
+    /placeholder="\/opt\/workday"/u,
+  ];
+  for (const pattern of staleCopyPatterns) {
+    assert.doesNotMatch(app, pattern);
+  }
 });
 
 test('mobile UI tries to lock mobile browsers to portrait orientation', async () => {
@@ -2519,6 +2562,556 @@ test('running turns keep message sending available and move stop into settings',
   assert.doesNotMatch(app, /function onComposerSubmit\(event\)\s*\{[\s\S]{0,180}if \(state\.pendingTurn\)/u);
 });
 
+test('steer composer stays enabled and labels submit as append instruction during a running turn', async () => {
+  const { api, context } = await loadAppHarness();
+
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', cwd: '/repo' };
+  api.state.pendingTurn = true;
+  api.state.turnId = 'turn_1';
+  api.state.prompt = 'follow up';
+
+  api.render();
+
+  const html = context.__elements.get('#app').innerHTML;
+  const textarea = html.match(/<textarea\b[^>]*id="prompt-input"[^>]*>/u)?.[0] || '';
+  assert.ok(textarea);
+  assert.doesNotMatch(textarea, /\bdisabled\b/u);
+  assert.match(html, /<button\b[^>]*type="submit"[^>]*>[\s\S]*追加指令[\s\S]*<\/button>/u);
+  assert.match(html, /id="stop-button"/u);
+});
+
+test('steer submit posts to the active turn and renders the local user message as steering', async () => {
+  const fetchCalls = [];
+  const { api } = await loadAppHarness({
+    fetch: async (path, options = {}) => {
+      fetchCalls.push({ path, options });
+      if (path === '/api/turns/turn_1/steer') {
+        return {
+          ok: true,
+          status: 202,
+          json: async () => ({ turnId: 'turn_1' }),
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', cwd: '/repo' };
+  api.state.pendingTurn = true;
+  api.state.turnId = 'turn_1';
+  api.state.prompt = 'Add tests for the running path';
+
+  await api.onComposerSubmit({ preventDefault() {} });
+
+  assert.deepEqual(fetchCalls.map((call) => call.path), ['/api/turns/turn_1/steer']);
+  assert.equal(JSON.parse(fetchCalls[0].options.body).text, 'Add tests for the running path');
+  assert.equal(api.state.pendingTurn, true);
+  assert.equal(api.state.turnId, 'turn_1');
+  assert.equal(api.state.prompt, '');
+  const latestUser = api.state.timeline.findLast((item) => item.role === 'user');
+  assert.equal(latestUser?.meta, 'steering');
+  assert.equal(latestUser?.text, 'Add tests for the running path');
+});
+
+test('steer unsupported response is visible and keeps the active turn running', async () => {
+  const { api } = await loadAppHarness({
+    fetch: async (path) => {
+      if (path === '/api/turns/turn_1/steer') {
+        return {
+          ok: false,
+          status: 409,
+          json: async () => ({
+            error: 'steer_not_supported',
+            message: '当前 Codex runtime 不支持追加指令',
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', cwd: '/repo' };
+  api.state.pendingTurn = true;
+  api.state.turnId = 'turn_1';
+  api.state.status = 'Turn running';
+  api.state.prompt = 'Try steering';
+
+  await api.onComposerSubmit({ preventDefault() {} });
+
+  assert.equal(api.state.pendingTurn, true);
+  assert.equal(api.state.turnId, 'turn_1');
+  assert.equal(api.state.status, 'Turn running');
+  assert.match(api.state.timeline.map((item) => item.text || '').join('\n'), /当前 Codex runtime 不支持追加指令/u);
+});
+
+test('desktop notebook layout renders quiet sidebar navigation and account footer', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = {
+    principal: {
+      username: 'admin',
+    },
+  };
+  api.state.view = 'sessions';
+  api.state.sessions = [
+    { id: 'session_1', title: 'E2E share clone 1780972512943', cwd: '/repo', updatedAt: Date.now() },
+    { id: 'session_2', title: 'deploy stream smoke', cwd: '/repo', updatedAt: Date.now() - 60000 },
+  ];
+
+  api.render();
+
+  const html = context.__elements.get('#app').innerHTML;
+  assert.match(html, /class="desktop-shell notebook-shell"/u);
+  assert.match(html, /class="[^"]*\bnotebook-sidebar\b[^"]*"/u);
+  assert.match(html, /class="sidebar-brand"/u);
+  assert.match(html, /class="sidebar-nav"/u);
+  assert.match(html, />工作台</u);
+  assert.match(html, />报告</u);
+  assert.match(html, />管理</u);
+  assert.match(html, />设置</u);
+  assert.doesNotMatch(html, /Grok 搜索|档案|整理|输出|文件/u);
+  assert.match(html, /class="sidebar-section-title"[\s\S]*最近/u);
+  assert.match(html, /class="sidebar-account"/u);
+  assert.match(html, /<small>admin<\/small>/u);
+});
+
+test('desktop notebook sidebar is the only new conversation surface', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'sessions';
+  api.state.sessions = [];
+  api.state.currentSession = null;
+  api.state.sessionId = '';
+
+  api.render();
+
+  const html = context.__elements.get('#app').innerHTML;
+  assert.equal((html.match(/id="new-session-button"/gu) || []).length, 1);
+  assert.equal((html.match(/>新对话</gu) || []).length, 1);
+  assert.doesNotMatch(html, /id="empty-new-session-button"/u);
+  assert.doesNotMatch(html, /class="new-session-btn"/u);
+  assert.doesNotMatch(html, />新建任务</u);
+});
+
+test('desktop notebook new conversation opens a lightweight responsive draft', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'chat';
+  api.state.sessions = [
+    { id: 'session_1', title: 'Existing session', cwd: '/repo', updatedAt: Date.now() },
+  ];
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', title: 'Existing session', cwd: '/repo' };
+  api.state.timeline = [{ id: 'm1', kind: 'message', role: 'assistant', text: 'Existing answer' }];
+  api.state.sessionToolsOpen = true;
+
+  api.render();
+
+  const button = context.document.querySelector('#new-session-button');
+  assert.ok(button);
+  const beforeRenderCount = context.__appRenderCount;
+
+  button.click();
+
+  assert.equal(context.__appRenderCount, beforeRenderCount + 1);
+  assert.equal(api.state.view, 'chat');
+  assert.equal(api.state.sessionId, '');
+  assert.equal(api.state.currentSession, null);
+  assert.equal(api.state.sessionToolsOpen, false);
+  const html = context.document.querySelector('#app').innerHTML;
+  assert.match(html, /id="prompt-input"/u);
+  assert.doesNotMatch(html, /class="session-tools"/u);
+
+  const nextButton = context.document.querySelector('#new-session-button');
+  assert.ok(nextButton);
+  nextButton.click();
+
+  assert.equal(context.__appRenderCount, beforeRenderCount + 2);
+});
+
+test('desktop notebook sidebar search filters recents without rerendering the whole shell', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'sessions';
+  api.state.sessions = [
+    { id: 'session_alpha', title: 'Alpha refactor', cwd: '/repo', updatedAt: Date.now() },
+    { id: 'session_deploy', title: 'Deploy preview', cwd: '/repo', updatedAt: Date.now() - 1000 },
+  ];
+
+  api.render();
+
+  const search = context.document.querySelector('#session-search');
+  assert.ok(search);
+  const beforeRenderCount = context.__appRenderCount;
+  search.value = 'deploy';
+  search.__listeners.get('input')?.({ target: search });
+
+  assert.equal(api.state.search, 'deploy');
+  assert.equal(context.__appRenderCount, beforeRenderCount);
+  const recents = context.document.querySelector('#sidebar-recents');
+  assert.ok(recents);
+  assert.match(recents.innerHTML, /Deploy preview/u);
+  assert.doesNotMatch(recents.innerHTML, /Alpha refactor/u);
+});
+
+test('desktop notebook sidebar recents stay bounded for large noisy histories', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  const longPreview = `very-long-preview-${'x'.repeat(5000)}`;
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'sessions';
+  api.state.sessions = Array.from({ length: 80 }, (_, index) => ({
+    id: `session_${index}`,
+    title: `Session ${index}`,
+    preview: `${longPreview}-${index}`,
+    cwd: '/repo',
+    updatedAt: Date.now() - index,
+  }));
+
+  api.render();
+
+  const search = context.document.querySelector('#session-search');
+  assert.ok(search);
+  search.value = 'Session';
+  search.__listeners.get('input')?.({ target: search });
+  search.value = '';
+  search.__listeners.get('input')?.({ target: search });
+
+  const recents = context.document.querySelector('#sidebar-recents');
+  assert.ok(recents);
+  assert.ok((recents.innerHTML.match(/class="session-card/gu) || []).length <= 30);
+  assert.ok(recents.innerHTML.length < 30000);
+  assert.doesNotMatch(recents.innerHTML, new RegExp(`x{${500}}`, 'u'));
+  assert.match(recents.innerHTML, /还有 50 个会话/u);
+});
+
+test('desktop notebook sidebar renders compact recents without hidden action buttons', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'capabilities';
+  api.state.sessions = Array.from({ length: 40 }, (_, index) => ({
+    id: `session_${index}`,
+    title: `Session ${index}`,
+    preview: `Preview ${index}`,
+    cwd: '/repo',
+    updatedAt: Date.now() - index,
+  }));
+
+  api.render();
+
+  const recents = context.document.querySelector('#sidebar-recents');
+  assert.ok(recents);
+  assert.equal((recents.innerHTML.match(/class="session-card/gu) || []).length, 30);
+  assert.equal((recents.innerHTML.match(/class="session-main"/gu) || []).length, 30);
+  assert.equal((recents.innerHTML.match(/class="mini-btn"/gu) || []).length, 0);
+  assert.equal((recents.innerHTML.match(/data-favorite=/gu) || []).length, 0);
+  assert.equal((recents.innerHTML.match(/data-archive=/gu) || []).length, 0);
+});
+
+test('desktop notebook sidebar has one explicit entry for each primary page', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'sessions';
+  api.render();
+
+  const html = context.document.querySelector('#app').innerHTML;
+  for (const view of ['sessions', 'capabilities', 'reports', 'admin', 'settings']) {
+    assert.equal((html.match(new RegExp(`data-view="${view}"`, 'gu')) || []).length, 1);
+  }
+  assert.doesNotMatch(html, /class="sidebar-add"/u);
+});
+
+test('desktop workbench capability shortcuts stay lightweight and do not open session tools', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'capabilities';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', title: 'Current session', cwd: '/repo' };
+  api.state.sessionToolsOpen = false;
+
+  api.render();
+
+  const shortcut = context.document.querySelector('[data-capability-target="chat"]');
+  assert.ok(shortcut);
+  const beforeRenderCount = context.__appRenderCount;
+  shortcut.click();
+
+  assert.equal(context.__appRenderCount, beforeRenderCount + 1);
+  assert.equal(api.state.view, 'chat');
+  assert.equal(api.state.sessionToolsOpen, false);
+  assert.doesNotMatch(context.document.querySelector('#app').innerHTML, /class="session-tools"/u);
+});
+
+test('desktop notebook chat keeps long timelines bounded and offers older history loading', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_long';
+  api.state.currentSession = { id: 'session_long', title: 'Long session', cwd: '/repo' };
+  api.state.timeline = Array.from({ length: 180 }, (_, index) => ({
+    id: `message_${index}`,
+    kind: 'message',
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    text: `Message ${index} ${'x'.repeat(9000)}`,
+  }));
+
+  api.render();
+
+  let html = context.document.querySelector('#app').innerHTML;
+  assert.equal((html.match(/<article class="message /gu) || []).length, 80);
+  assert.match(html, /较早 100 条已折叠/u);
+  assert.match(html, /id="show-more-timeline"/u);
+  assert.match(html, /内容过长，已截断/u);
+  assert.doesNotMatch(html, new RegExp(`x{${8500}}`, 'u'));
+  assert.ok(html.length < 750000);
+
+  const showMore = context.document.querySelector('#show-more-timeline');
+  assert.ok(showMore);
+  showMore.click();
+
+  html = context.document.querySelector('#app').innerHTML;
+  assert.equal((html.match(/<article class="message /gu) || []).length, 160);
+  assert.match(html, /较早 20 条已折叠/u);
+});
+
+test('desktop notebook chat keeps the composer in a stable bottom row when panels are open', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_panel';
+  api.state.currentSession = { id: 'session_panel', title: 'Panel session', cwd: '/repo' };
+  api.state.notice = '后台刷新中';
+  api.state.sessionToolsOpen = true;
+  api.state.workspaceOpen = true;
+  api.state.workspaceStatus = {
+    cwd: '/repo',
+    isGitRepository: true,
+    branch: 'main',
+    diskWritable: true,
+    counts: { staged: 1, unstaged: 2, untracked: 3 },
+    files: [{ path: 'src/app.ts', indexStatus: ' ', worktreeStatus: 'M' }],
+  };
+  api.state.workspaceDiff = {
+    files: [{ path: 'src/app.ts', hunks: [{ header: '@@ -1 +1 @@', lines: ['-old', '+new'] }] }],
+  };
+  api.state.timeline = Array.from({ length: 180 }, (_, index) => ({
+    id: `panel_message_${index}`,
+    kind: 'message',
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    text: `Message ${index}`,
+  }));
+
+  api.render();
+
+  const html = context.document.querySelector('#app').innerHTML;
+  assert.match(html, /<div class="chat-panels">[\s\S]*class="notice-line"[\s\S]*class="session-tools"[\s\S]*class="workspace-inspector"[\s\S]*<\/div>\s*<main class="timeline chat-canvas" id="timeline">[\s\S]*<form class="composer composer-tray" id="composer-form">/u);
+  assert.match(html, /id="prompt-input"/u);
+
+  const styles = await readFile(stylesUrl, 'utf8');
+  assert.match(styles, /\.notebook-chat\s*\{[^}]*height:\s*100dvh;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;[^}]*grid-template-rows:\s*auto auto minmax\(0,\s*1fr\) auto;/su);
+  assert.match(styles, /\.notebook-chat\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/su);
+  assert.match(styles, /\.chat-panels\s*\{[^}]*max-height:\s*min\(32dvh,\s*340px\);[^}]*overflow:\s*auto;/su);
+  assert.match(styles, /\.chat-canvas\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/su);
+  assert.match(styles, /\.composer-tray\s*\{[^}]*margin:\s*0 max\(32px,\s*calc\(\(100% - 1040px\) \/ 2\)\);[^}]*padding-bottom:\s*calc\(18px \+ var\(--safe-bottom\)\);/su);
+});
+
+test('desktop notebook shell constrains panes to the viewport instead of expanding with sidebar history', async () => {
+  const styles = await readFile(stylesUrl, 'utf8');
+
+  assert.match(styles, /\.desktop-shell\s*\{[^}]*height:\s*100dvh;[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\);[^}]*overflow:\s*hidden;/su);
+  assert.match(styles, /\.session-pane\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/su);
+  assert.match(styles, /\.notebook-sidebar\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/su);
+  assert.match(styles, /\.sidebar-recents\s*\{[^}]*min-height:\s*0;[^}]*overflow:\s*auto;/su);
+});
+
+test('desktop notebook chat widths are constrained by the right pane', async () => {
+  const styles = await readFile(stylesUrl, 'utf8');
+
+  for (const selector of ['\\.chat-panels', '\\.chat-canvas', '\\.composer-tray']) {
+    assert.match(styles, new RegExp(`${selector}\\s*\\{[^}]*width:\\s*auto;[^}]*max-width:\\s*none;[^}]*justify-self:\\s*stretch;[^}]*margin:\\s*0 max\\(32px,\\s*calc\\(\\(100% - 1040px\\) / 2\\)\\);`, 'su'));
+  }
+});
+
+test('desktop workspace inspector button loads git status and diff for the active session', async () => {
+  const fetchCalls: string[] = [];
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+    fetch: async (path) => {
+      fetchCalls.push(String(path));
+      if (path === '/api/sessions/session_1/workspace/status') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: {
+              cwd: '/repo',
+              exists: true,
+              isGitRepository: true,
+              branch: 'main',
+              upstream: 'origin/main',
+              diskWritable: true,
+              counts: { staged: 1, unstaged: 1, untracked: 1, total: 3 },
+              files: [
+                { path: 'src/app.ts', indexStatus: ' ', worktreeStatus: 'M' },
+                { path: 'README.md', indexStatus: 'A', worktreeStatus: ' ' },
+              ],
+              lastCommit: { shortHash: 'abc1234', message: 'initial commit' },
+            },
+          }),
+        };
+      }
+      if (path === '/api/sessions/session_1/workspace/diff') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            diff: {
+              raw: 'diff --git a/src/app.ts b/src/app.ts\n@@ -1 +1 @@\n-old\n+new',
+              files: [{ path: 'src/app.ts', hunks: [{ header: '@@ -1 +1 @@', lines: ['-old', '+new'] }] }],
+            },
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', title: 'Workspace session', cwd: '/repo' };
+
+  api.render();
+
+  const button = context.document.querySelector('#toggle-workspace');
+  assert.ok(button);
+  await button.__listeners.get('click')?.();
+  await flushMicrotasks();
+
+  assert.deepEqual(fetchCalls, [
+    '/api/sessions/session_1/workspace/status',
+    '/api/sessions/session_1/workspace/diff',
+  ]);
+  const html = context.document.querySelector('#app').innerHTML;
+  assert.match(html, /class="workspace-inspector"/u);
+  assert.match(html, /main/u);
+  assert.match(html, /origin\/main/u);
+  assert.match(html, /已暂存 1/u);
+  assert.match(html, /未暂存 1/u);
+  assert.match(html, /未跟踪 1/u);
+  assert.match(html, /src\/app\.ts/u);
+  assert.match(html, /\+new/u);
+});
+
+test('desktop notebook chat uses canvas stage and floating tray composer', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', title: 'E2E share clone 1780972512943', cwd: '/repo' };
+  api.state.timeline = [
+    { id: 'u1', kind: 'message', role: 'user', text: '你能干啥' },
+    { id: 'a1', kind: 'message', role: 'assistant', text: '我可以帮你做很多文字、代码和创意类工作。' },
+  ];
+
+  api.render();
+
+  const html = context.__elements.get('#app').innerHTML;
+  assert.match(html, /class="chat-pane notebook-chat"/u);
+  assert.match(html, /class="[^"]*\bchat-canvas\b[^"]*"/u);
+  assert.match(html, /class="[^"]*\bcomposer-tray\b[^"]*"/u);
+  assert.match(html, /placeholder="输入任务或追加指令"/u);
+  assert.match(html, /class="composer-tool-row"/u);
+  assert.match(html, /class="composer-model-pill"/u);
+});
+
+test('capabilities command panel exposes the complete remote command set', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'capabilities';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', title: 'Remote command work', cwd: '/repo' };
+
+  api.render();
+
+  const html = context.document.querySelector('#app').innerHTML;
+  for (const command of ['/help', '/status', '/model', '/permissions', '/plan', '/goal', '/resume', '/fork', '/mcp', '/skills', '/plugins']) {
+    assert.match(html, new RegExp(`data-command="${command.replace('/', '\\/')}`, 'u'));
+  }
+});
+
 test('composer queues a new message while a turn is already running', async () => {
   const fetchCalls = [];
   const { api } = await loadAppHarness({
@@ -2747,6 +3340,218 @@ test('starting a new turn does not reuse the previous turn event sequence in the
 
   const eventsCall = fetchCalls.find((call) => call.path.startsWith('/api/turns/turn_2/events'));
   assert.equal(eventsCall?.path, '/api/turns/turn_2/events');
+});
+
+test('recovering an active turn requests only events after the last seen sequence', async () => {
+  const fetchCalls = [];
+  const { api } = await loadAppHarness({
+    fetch: async (path, options = {}) => {
+      fetchCalls.push({ path, options });
+      if (path === '/api/turns/turn_1/events?after=99') {
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            getReader: () => ({
+              read: async () => ({ done: true }),
+            }),
+          },
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.sessionId = 'session_1';
+  api.state.turnId = 'turn_1';
+  api.state.pendingTurn = true;
+  api.state.lastTurnEventSequence = 99;
+
+  await api.streamTurnEvents('turn_1', { forceReconnect: true });
+
+  assert.equal(fetchCalls[0]?.path, '/api/turns/turn_1/events?after=99');
+});
+
+test('auth restore defers the workspace event stream until after page load', async () => {
+  const fetchCalls: Array<{ path: string; options: any }> = [];
+  const { api, context } = await loadAppHarness({
+    setTimeout: (callback: () => void) => {
+      callback();
+      return 1;
+    },
+    clearTimeout: () => {},
+    fetch: async (path, options = {}) => {
+      fetchCalls.push({ path, options });
+      if (path === '/api/auth/me') {
+        return { ok: true, status: 200, json: async () => ({ session: { id: 'auth_1' } }) };
+      }
+      if (path === '/api/settings') {
+        return { ok: true, status: 200, json: async () => ({ settings: {}, permissions: {} }) };
+      }
+      if (path === '/api/models') {
+        return { ok: true, status: 200, json: async () => ({ items: [] }) };
+      }
+      if (path === '/api/sessions') {
+        return { ok: true, status: 200, json: async () => ({ items: [] }) };
+      }
+      if (path === '/api/workspace/events') {
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            getReader: () => ({
+              read: async () => ({ done: true }),
+            }),
+          },
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  await api.restoreAuth();
+  await flushMicrotasks();
+
+  assert.equal(fetchCalls.some((call) => call.path === '/api/workspace/events'), false);
+
+  for (const listener of context.__windowListeners.get('load') || []) {
+    listener();
+  }
+  await flushMicrotasks();
+
+  assert.equal(fetchCalls.some((call) => call.path === '/api/workspace/events'), true);
+});
+
+test('workspace event stream reconnects with the last seen event sequence', async () => {
+  const fetchCalls: Array<{ path: string; options: any }> = [];
+  const { api } = await loadAppHarness({
+    fetch: async (path, options = {}) => {
+      fetchCalls.push({ path, options });
+      if (path === '/api/workspace/events?after=42') {
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            getReader: () => ({
+              read: async () => ({ done: true }),
+            }),
+          },
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.lastWorkspaceEventSequence = 42;
+  await api.connectWorkspaceEvents({ forceReconnect: true });
+
+  assert.equal(fetchCalls[0]?.path, '/api/workspace/events?after=42');
+});
+
+test('workspace events refresh the session list and the active session timeline', async () => {
+  const fetchCalls: Array<{ path: string; options: any }> = [];
+  const { api } = await loadAppHarness({
+    fetch: async (path, options = {}) => {
+      fetchCalls.push({ path, options });
+      if (path === '/api/sessions') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            items: [{ id: 'session_1', settings: { metadata: {} }, thread: { turns: [] }, timeline: [] }],
+          }),
+        };
+      }
+      if (path === '/api/sessions/session_1') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            session: {
+              id: 'session_1',
+              settings: { metadata: {} },
+              thread: { turns: [] },
+              timeline: [{ id: 'system_1', kind: 'message', role: 'system', text: 'done' }],
+            },
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', settings: { metadata: {} }, thread: { turns: [] }, timeline: [] };
+
+  await api.applyWorkspaceEvent({ type: 'turn.completed', sessionId: 'session_1', turnId: 'turn_1' });
+
+  assert.deepEqual(fetchCalls.map((call) => call.path), ['/api/sessions', '/api/sessions/session_1']);
+  assert.equal(api.state.timeline[0]?.text, 'done');
+});
+
+test('workspace event bursts coalesce refreshes while the composer is focused', async () => {
+  const fetchCalls: Array<{ path: string; options: any }> = [];
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1200,
+    fetch: async (path, options = {}) => {
+      fetchCalls.push({ path, options });
+      if (path === '/api/sessions') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            items: [{ id: 'session_1', settings: { metadata: {} }, thread: { turns: [] }, timeline: [] }],
+          }),
+        };
+      }
+      if (path === '/api/sessions/session_1') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            session: {
+              id: 'session_1',
+              settings: { metadata: {} },
+              thread: { turns: [] },
+              timeline: [{ id: 'system_1', kind: 'message', role: 'system', text: 'done' }],
+            },
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', settings: { metadata: {} }, thread: { turns: [] }, timeline: [] };
+  api.state.prompt = '/help';
+  api.render();
+  const promptInput = context.document.querySelector('#prompt-input');
+  if (promptInput) {
+    promptInput.closest = (selector: string) => selector.includes('textarea') ? promptInput : null;
+    promptInput.focus();
+  }
+  const renderCountAfterFocus = context.__appRenderCount;
+
+  await Promise.all(Array.from({ length: 50 }, (_, index) => api.applyWorkspaceEvent({
+    type: index % 2 === 0 ? 'turn.completed' : 'session.updated',
+    sessionId: 'session_1',
+    turnId: `turn_${index}`,
+  })));
+
+  assert.deepEqual(fetchCalls.map((call) => call.path), ['/api/sessions', '/api/sessions/session_1']);
+  assert.equal(context.__appRenderCount, renderCountAfterFocus);
+  assert.equal(api.state.timeline[0]?.text, 'done');
 });
 
 test('session refresh keeps a just-started turn running when backend detail temporarily omits the active turn marker', async () => {
@@ -3066,11 +3871,66 @@ test('composer renders handled goal slash command results without streaming a tu
 
   assert.deepEqual(fetchCalls.map((call) => call.path), ['/api/sessions/session_goal/turns']);
   assert.equal(api.state.pendingTurn, false);
-  assert.equal(api.state.turnId, null);
+  assert.equal(api.state.turnId, '');
   assert.equal(api.state.status, 'Ready');
   assert.deepEqual(api.state.timeline.map((item) => item.text), [
     '/goal resume',
     'Goal resumed: ship slash goal support',
+  ]);
+});
+
+test('composer keeps plan command text as a draft without streaming or refetching', async () => {
+  const fetchCalls = [];
+  const { api } = await loadAppHarness({
+    fetch: async (path, options = {}) => {
+      fetchCalls.push({ path, options });
+      if (path === '/api/sessions/session_plan/turns') {
+        return {
+          ok: true,
+          status: 202,
+          json: async () => ({
+            type: 'command',
+            command: {
+              name: 'plan',
+              action: 'switch',
+              message: 'Plan mode enabled. Draft prompt: Build the workspace inspector',
+              draftPrompt: 'Build the workspace inspector',
+              goal: null,
+            },
+            session: {
+              id: 'session_plan',
+              cwd: '/repo',
+              settings: { collaborationMode: 'plan', metadata: {} },
+              timeline: [
+                { id: 'command_user_plan', kind: 'message', role: 'user', label: 'You', meta: 'command', text: '/plan Build the workspace inspector' },
+                { id: 'command_plan_switch', kind: 'message', role: 'system', label: '/plan', meta: 'switch', text: 'Plan mode enabled. Draft prompt: Build the workspace inspector' },
+              ],
+              thread: { turns: [] },
+            },
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { id: 'auth_1' };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_plan';
+  api.state.currentSession = { id: 'session_plan', cwd: '/repo' };
+  api.state.prompt = '/plan Build the workspace inspector';
+
+  await api.onComposerSubmit({ preventDefault() {} });
+
+  assert.deepEqual(fetchCalls.map((call) => call.path), ['/api/sessions/session_plan/turns']);
+  assert.equal(api.state.pendingTurn, false);
+  assert.equal(api.state.turnId, '');
+  assert.equal(api.state.prompt, 'Build the workspace inspector');
+  assert.equal(api.state.currentSession.settings.collaborationMode, 'plan');
+  assert.deepEqual(api.state.timeline.map((item) => item.text), [
+    '/plan Build the workspace inspector',
+    'Plan mode enabled. Draft prompt: Build the workspace inspector',
   ]);
 });
 
@@ -3218,7 +4078,7 @@ test('composer renders handled help slash command results with report links', as
   const html = api.renderTimelineItem(latest);
   assert.deepEqual(fetchCalls.map((call) => call.path), ['/api/sessions/session_help/turns']);
   assert.equal(api.state.pendingTurn, false);
-  assert.equal(api.state.turnId, null);
+  assert.equal(api.state.turnId, '');
   assert.equal(latest?.role, 'system');
   assert.equal(latest?.label, '/help');
   assert.match(html, /<code>\/help<\/code>/u);
@@ -4107,6 +4967,35 @@ test('chat metadata refresh keeps the focused composer input', async () => {
 
   const nextPromptInput = context.document.querySelector('#prompt-input');
   assert.equal(context.document.activeElement, nextPromptInput);
+});
+
+test('full render preserves the focused composer draft and caret', async () => {
+  const { api, context } = await loadAppHarness();
+
+  api.state.authSession = { id: 'auth_1' };
+  api.state.token = 'token';
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', cwd: '/repo', settings: { metadata: {} } };
+  api.state.sessions = [api.state.currentSession];
+  api.state.prompt = 'draft before render';
+  api.render();
+
+  const promptInput = context.document.querySelector('#prompt-input');
+  promptInput.closest = (selector: string) => selector.includes('textarea') ? promptInput : null;
+  promptInput.value = 'user typed text';
+  promptInput.selectionStart = 5;
+  promptInput.selectionEnd = 9;
+  promptInput.focus();
+
+  api.render();
+
+  const nextPromptInput = context.document.querySelector('#prompt-input');
+  assert.equal(context.document.activeElement, nextPromptInput);
+  assert.equal(api.state.prompt, 'user typed text');
+  assert.equal(nextPromptInput.value, 'user typed text');
+  assert.equal(nextPromptInput.selectionStart, 5);
+  assert.equal(nextPromptInput.selectionEnd, 9);
 });
 
 test('sending a message keeps a following chat timeline at the latest content', async () => {
@@ -6554,7 +7443,7 @@ test('desktop composer is larger, shows Refresh and Send, and does not render th
   assert.doesNotMatch(app, /document\.querySelector\('#composer-form'\)\?\.requestSubmit\(\)/u);
 });
 
-test('desktop prompt Enter does not submit the form', async () => {
+test('desktop prompt Enter submits and Shift Enter keeps a newline', async () => {
   let submitCount = 0;
   const { api, context } = await loadAppHarness({ viewportWidth: 900, desktopPointer: true });
 
@@ -6584,8 +7473,8 @@ test('desktop prompt Enter does not submit the form', async () => {
   };
   api.handlePromptKeydown(enterEvent);
 
-  assert.equal(enterEvent.prevented, false);
-  assert.equal(submitCount, 0);
+  assert.equal(enterEvent.prevented, true);
+  assert.equal(submitCount, 1);
 
   const shiftEnterEvent = {
     key: 'Enter',
@@ -6601,7 +7490,110 @@ test('desktop prompt Enter does not submit the form', async () => {
   api.handlePromptKeydown(shiftEnterEvent);
 
   assert.equal(shiftEnterEvent.prevented, false);
-  assert.equal(submitCount, 0);
+  assert.equal(submitCount, 1);
+});
+
+test('composer send button clicks submit through the stable composer handler', async () => {
+  let submitCount = 0;
+  const { api, context } = await loadAppHarness({ viewportWidth: 900, desktopPointer: true });
+
+  api.state.authSession = { id: 'auth_1' };
+  api.state.token = 'token';
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', cwd: '/repo', settings: { metadata: {} } };
+  api.state.prompt = 'send from button';
+  api.render();
+
+  const composerForm = context.document.querySelector('#composer-form');
+  assert.ok(composerForm);
+  composerForm.requestSubmit = () => {
+    submitCount += 1;
+  };
+
+  const sendButton = context.document.querySelector('#send-button');
+  assert.ok(sendButton);
+  sendButton.click();
+
+  assert.equal(submitCount, 1);
+});
+
+test('submitting a focused composer clears the visible draft after local render', async () => {
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 900,
+    desktopPointer: true,
+    fetch: async (path) => {
+      if (path === '/api/sessions/session_1/turns') {
+        return {
+          ok: true,
+          status: 202,
+          json: async () => ({ turnId: 'turn_1' }),
+        };
+      }
+      if (path === '/api/turns/turn_1/events') {
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            getReader: () => ({
+              read: async () => ({ done: true }),
+            }),
+          },
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.authSession = { id: 'auth_1' };
+  api.state.token = 'token';
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', cwd: '/repo', settings: { metadata: {} } };
+  api.state.prompt = 'clear me after submit';
+  api.render();
+
+  const promptInput = context.document.querySelector('#prompt-input');
+  promptInput.value = 'clear me after submit';
+  promptInput.focus();
+
+  await api.onComposerSubmit({ preventDefault() {} });
+
+  const nextPromptInput = context.document.querySelector('#prompt-input');
+  assert.equal(api.state.prompt, '');
+  assert.equal(nextPromptInput.value, '');
+});
+
+test('running composer queue button stores the draft without sending it immediately', async () => {
+  const fetchCalls = [];
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 900,
+    desktopPointer: true,
+    fetch: async (path, options = {}) => {
+      fetchCalls.push({ path, options });
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.authSession = { id: 'auth_1' };
+  api.state.token = 'token';
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', cwd: '/repo', settings: { metadata: {} } };
+  api.state.pendingTurn = true;
+  api.state.turnId = 'turn_1';
+  api.state.prompt = 'queue after current turn';
+  api.render();
+
+  const queueButton = context.document.querySelector('#queue-message-button');
+  assert.ok(queueButton);
+  queueButton.click();
+
+  assert.deepEqual(fetchCalls, []);
+  assert.equal(api.state.prompt, '');
+  assert.equal(api.queuedMessagesForCurrentSession().map((item) => item.text).join('\n'), 'queue after current turn');
+  assert.match(context.document.querySelector('#app').innerHTML, /已加入排队/u);
+  assert.match(context.document.querySelector('#app').innerHTML, /class="queued-message-row"/u);
 });
 
 test('desktop composer refresh button refreshes the current session without relying on browser reload', async () => {
@@ -8296,8 +9288,8 @@ test('PWA standalone mode enables local pull-to-refresh without normal browser r
     readFile(pwaPullRefreshUrl, 'utf8'),
   ]);
 
-  assert.match(index, /<script src="\/pwa-pull-refresh\.js"><\/script>/u);
-  assert.match(serviceWorker, /'\/pwa-pull-refresh\.js'/u);
+  assert.match(index, /<script src="\/pwa-pull-refresh\.js\?v=20260609-render-stability-fix1"><\/script>/u);
+  assert.match(serviceWorker, /`\/pwa-pull-refresh\.js\?v=\$\{ASSET_VERSION\}`/u);
   assert.match(app, /function isStandalonePwa\(\)/u);
   assert.match(app, /navigator\.standalone === true/u);
   assert.match(app, /matchMedia\('\(display-mode: standalone\)'\)/u);
@@ -9398,6 +10390,7 @@ async function loadAppHarness(overrides = {}) {
   const app = await readFile(appUrl, 'utf8');
   const storage = new Map(Object.entries(overrides.storage || {}));
   const elements = new Map();
+  const windowListeners = new Map();
   let activeElement = null;
   const removeClasses = (element, classNames) => {
     const current = new Set(String(element.className || '').split(/\s+/u).filter(Boolean));
@@ -9465,7 +10458,15 @@ async function loadAppHarness(overrides = {}) {
     querySelector: () => null,
     getBoundingClientRect: () => ({ height: 0 }),
     click() {
-      this.__listeners.get('click')?.({ target: this, stopPropagation() {} });
+      this.__listeners.get('click')?.({
+        target: this,
+        currentTarget: this,
+        defaultPrevented: false,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+        stopPropagation() {},
+      });
     },
     focus() {
       activeElement = this;
@@ -9485,13 +10486,30 @@ async function loadAppHarness(overrides = {}) {
 	  };
 	  const materializeAppHtml = (html) => {
     elements.delete('#timeline');
+    elements.delete('#composer-form');
     elements.delete('#prompt-input');
+    elements.delete('#send-button');
+    elements.delete('.send-btn');
+    elements.delete('#queue-message-button');
+    elements.delete('#new-session-button');
+    elements.delete('#session-search');
+    elements.delete('#sidebar-recents');
+    elements.delete('#show-more-timeline');
+    elements.delete('#toggle-workspace');
+    elements.delete('#refresh-workspace');
     elements.delete('.report-viewer');
+	    elements.delete('[data-capability-target="chat"]');
 	    elements.delete('#mobile-sidebar-toggle-button');
 	    elements.delete('#mobile-drawer-backdrop');
 	    elements.delete('.mobile-project-drawer');
 	    for (const key of [...elements.keys()]) {
 	      if (key.startsWith('[data-sort-mode="')) {
+	        elements.delete(key);
+	      }
+	      if (key.startsWith('[data-capability-target][')) {
+	        elements.delete(key);
+	      }
+	      if (key.startsWith('[data-workspace-file][')) {
 	        elements.delete(key);
 	      }
 	    }
@@ -9504,11 +10522,63 @@ async function loadAppHarness(overrides = {}) {
         clientHeight: 400,
       }));
     }
+    if (String(html || '').includes('id="composer-form"')) {
+      const formHtml = String(html).match(/<form\b[^>]*id="composer-form"[^>]*>/u)?.[0] || '';
+      const form = createElementFromHtml('#composer-form', formHtml, {
+        requestSubmit() {
+          this.__listeners.get('submit')?.({
+            target: this,
+            currentTarget: this,
+            preventDefault() {},
+          });
+        },
+      });
+      trackElement('#composer-form', form);
+    }
     if (String(html || '').includes('id="prompt-input"')) {
       trackElement('#prompt-input', createTrackedElement('#prompt-input', {
         value: '',
         scrollHeight: 38,
       }));
+    }
+    if (String(html || '').includes('id="send-button"')) {
+      const sendHtml = String(html).match(/<button\b[^>]*id="send-button"[^>]*>/u)?.[0] || '';
+      const sendButton = createElementFromHtml('#send-button', sendHtml);
+      trackElement('#send-button', sendButton);
+      trackElement('.send-btn', sendButton);
+    }
+    if (String(html || '').includes('id="queue-message-button"')) {
+      const queueHtml = String(html).match(/<button\b[^>]*id="queue-message-button"[^>]*>/u)?.[0] || '';
+      trackElement('#queue-message-button', createElementFromHtml('#queue-message-button', queueHtml));
+    }
+    if (String(html || '').includes('id="new-session-button"')) {
+      const newSessionHtml = String(html).match(/<button\b[^>]*id="new-session-button"[^>]*>/u)?.[0] || '';
+      trackElement('#new-session-button', createElementFromHtml('#new-session-button', newSessionHtml));
+    }
+    if (String(html || '').includes('id="session-search"')) {
+      const searchHtml = String(html).match(/<input\b[^>]*id="session-search"[^>]*>/u)?.[0] || '';
+      const value = searchHtml.match(/\svalue="([^"]*)"/u)?.[1] || '';
+      trackElement('#session-search', createElementFromHtml('#session-search', searchHtml, {
+        value,
+      }));
+    }
+    if (String(html || '').includes('id="sidebar-recents"')) {
+      const recentsHtml = String(html).match(/<section\b[^>]*id="sidebar-recents"[^>]*>([\s\S]*?)<\/section>/u)?.[1] || '';
+      trackElement('#sidebar-recents', createTrackedElement('#sidebar-recents', {
+        innerHTML: recentsHtml,
+      }));
+    }
+    if (String(html || '').includes('id="show-more-timeline"')) {
+      const showMoreHtml = String(html).match(/<button\b[^>]*id="show-more-timeline"[^>]*>/u)?.[0] || '';
+      trackElement('#show-more-timeline', createElementFromHtml('#show-more-timeline', showMoreHtml));
+    }
+    if (String(html || '').includes('id="toggle-workspace"')) {
+      const toggleWorkspaceHtml = String(html).match(/<button\b[^>]*id="toggle-workspace"[^>]*>/u)?.[0] || '';
+      trackElement('#toggle-workspace', createElementFromHtml('#toggle-workspace', toggleWorkspaceHtml));
+    }
+    if (String(html || '').includes('id="refresh-workspace"')) {
+      const refreshWorkspaceHtml = String(html).match(/<button\b[^>]*id="refresh-workspace"[^>]*>/u)?.[0] || '';
+      trackElement('#refresh-workspace', createElementFromHtml('#refresh-workspace', refreshWorkspaceHtml));
     }
     if (String(html || '').includes('class="report-viewer"')) {
       const reportHtml = String(html).match(/<main class="report-viewer">([\s\S]*?)<\/main>/u)?.[1] || '';
@@ -9535,6 +10605,22 @@ async function loadAppHarness(overrides = {}) {
 	      const mode = match[1];
 	      trackElement(`[data-sort-mode="${mode}"]`, createElementFromHtml(`[data-sort-mode="${mode}"]`, match[0]));
 	    }
+	    let capabilityIndex = 0;
+	    for (const match of String(html || '').matchAll(/<button\b[^>]*data-capability-target="([^"]+)"[^>]*>/gu)) {
+	      const target = match[1];
+	      const element = createElementFromHtml(`[data-capability-target][${capabilityIndex}]`, match[0]);
+	      trackElement(`[data-capability-target][${capabilityIndex}]`, element);
+	      if (target === 'chat' && !elements.has('[data-capability-target="chat"]')) {
+	        trackElement('[data-capability-target="chat"]', element);
+	      }
+	      capabilityIndex += 1;
+	    }
+	    let workspaceFileIndex = 0;
+	    for (const match of String(html || '').matchAll(/<button\b[^>]*data-workspace-file="([^"]+)"[^>]*>/gu)) {
+	      const element = createElementFromHtml(`[data-workspace-file][${workspaceFileIndex}]`, match[0]);
+	      trackElement(`[data-workspace-file][${workspaceFileIndex}]`, element);
+	      workspaceFileIndex += 1;
+	    }
 	  };
   const appElement = {
     _innerHTML: '',
@@ -9560,6 +10646,7 @@ async function loadAppHarness(overrides = {}) {
     console,
     __appRenderCount: 0,
     __elements: elements,
+    __windowListeners: windowListeners,
     localStorage: {
       getItem: (key) => storage.get(key) || null,
       setItem: (key, value) => {
@@ -9571,6 +10658,7 @@ async function loadAppHarness(overrides = {}) {
     },
     document: {
       body: { scrollHeight: 0 },
+      readyState: overrides.documentReadyState || 'loading',
       visibilityState: 'visible',
       get activeElement() {
         return activeElement;
@@ -9596,6 +10684,16 @@ async function loadAppHarness(overrides = {}) {
 	            return true;
 	          });
 	        }
+	        if (selector === '[data-capability-target]') {
+	          return [...elements.entries()]
+	            .filter(([key]) => key.startsWith('[data-capability-target]['))
+	            .map(([, element]) => element);
+	        }
+	        if (selector === '[data-workspace-file]') {
+	          return [...elements.entries()]
+	            .filter(([key]) => key.startsWith('[data-workspace-file]['))
+	            .map(([, element]) => element);
+	        }
 	        return [];
 	      },
       createElement: () => ({
@@ -9609,7 +10707,11 @@ async function loadAppHarness(overrides = {}) {
         pathname: overrides.pathname || '/',
         reload() {},
       },
-      addEventListener() {},
+      addEventListener(type, listener) {
+        const listeners = windowListeners.get(type) || [];
+        listeners.push(listener);
+        windowListeners.set(type, listeners);
+      },
       matchMedia: overrides.matchMedia || ((query: string) => ({
         matches: Boolean(overrides.desktopPointer) && query === '(hover: hover) and (pointer: fine)',
         media: query,
@@ -9742,6 +10844,9 @@ globalThis.__codexWebTest = {
 	  handleSessionSettingsOutsideClick: typeof handleSessionSettingsOutsideClick === 'function' ? handleSessionSettingsOutsideClick : null,
 	  handleApiError: typeof handleApiError === 'function' ? handleApiError : null,
 	  streamTurnEvents,
+	  connectWorkspaceEvents: typeof connectWorkspaceEvents === 'function' ? connectWorkspaceEvents : null,
+	  stopWorkspaceEvents: typeof stopWorkspaceEvents === 'function' ? stopWorkspaceEvents : null,
+	  applyWorkspaceEvent: typeof applyWorkspaceEvent === 'function' ? applyWorkspaceEvent : null,
 	  applyTurnEvent: typeof applyTurnEvent === 'function' ? applyTurnEvent : null,
 	  enqueueQueuedMessage: typeof enqueueQueuedMessage === 'function' ? enqueueQueuedMessage : null,
 	  removeQueuedMessage: typeof removeQueuedMessage === 'function' ? removeQueuedMessage : null,

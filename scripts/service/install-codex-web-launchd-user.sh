@@ -56,7 +56,7 @@ EOF
 write_plist() {
   local command
   command=$(
-    printf 'set -euo pipefail; mkdir -p %s; set -a; source %s; set +a; cd %s; exec npm run serve --workspace packages/codex-web' \
+    printf 'set -euo pipefail; mkdir -p %s; set -a; source %s; set +a; cd %s; exec ./node_modules/.bin/tsx packages/codex-web/src/cli.ts serve' \
       "$(shell_escape "${LOG_DIR}")" \
       "$(shell_escape "${ENV_FILE}")" \
       "$(shell_escape "${REPO_ROOT}")"
