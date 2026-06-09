@@ -82,6 +82,7 @@ docs/rendering              本地 Markdown/report 渲染验证材料
 - [API 与运行链路映射](docs/API_MAP.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [移动端 E2E 检查清单](docs/MOBILE_E2E.md)
+- [项目接手文档](docs/HANDOVER.zh-CN.md)
 
 ## 环境要求
 

@@ -92,6 +92,7 @@ published as `Codex Phone Hub`.
 - [API and runtime map](docs/API_MAP.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
 - [Mobile E2E checklist](docs/MOBILE_E2E.md)
+- [Project handover guide](docs/HANDOVER.zh-CN.md)
 
 ## Requirements
 
