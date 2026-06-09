@@ -247,6 +247,86 @@ test('GET /api/sessions/:sessionId/workspace/files rejects path traversal', asyn
   }
 });
 
+test('POST /api/sessions/:sessionId/terminal starts a scoped command and streams output', async () => {
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-terminal-route-'));
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({ id: 'thread_1', cwd: projectDir }),
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const create = await fetch(`${server.baseUrl}/api/sessions/thread_1/terminal`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer cw_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        command: `${process.execPath} -e "console.log('terminal-ok')"`,
+      }),
+    });
+    assert.equal(create.status, 201);
+    const created = await create.json() as any;
+    assert.equal(created.terminal.sessionId, 'thread_1');
+    assert.equal(created.terminal.cwd, projectDir);
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const events = await fetch(`${server.baseUrl}/api/terminals/${created.terminal.id}/events`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(events.status, 200);
+    const text = await events.text();
+    assert.match(text, /terminal-ok/u);
+    assert.match(text, /"type":"exit"/u);
+  } finally {
+    await server.stop();
+    await fs.rm(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('POST /api/terminals/:id/stop stops a running session terminal', async () => {
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-terminal-stop-'));
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({ id: 'thread_1', cwd: projectDir }),
+    } as any,
+    config: createConfig(),
+  });
+  await server.start();
+  try {
+    const create = await fetch(`${server.baseUrl}/api/sessions/thread_1/terminal`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer cw_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        command: `${process.execPath} -e "setInterval(() => {}, 1000)"`,
+      }),
+    });
+    assert.equal(create.status, 201);
+    const created = await create.json() as any;
+
+    const stop = await fetch(`${server.baseUrl}/api/terminals/${created.terminal.id}/stop`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(stop.status, 200);
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const list = await fetch(`${server.baseUrl}/api/terminals`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(list.status, 200);
+    const payload = await list.json() as any;
+    assert.equal(payload.items[0].id, created.terminal.id);
+    assert.equal(payload.items[0].status, 'stopped');
+  } finally {
+    await server.stop();
+    await fs.rm(projectDir, { recursive: true, force: true });
+  }
+});
+
 test('POST /api/sessions/:sessionId/turns accepts attachments only from upload roots', async () => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-turn-attachments-state-'));
   const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-turn-attachments-project-'));

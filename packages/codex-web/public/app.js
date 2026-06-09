@@ -11,6 +11,7 @@ const SIDEBAR_SESSION_PREVIEW_LIMIT = 140;
 const TIMELINE_RENDER_LIMIT = 80;
 const TIMELINE_RENDER_STEP = 80;
 const TIMELINE_TEXT_LIMIT = 8000;
+const TERMINAL_OUTPUT_LIMIT = 24000;
 
 const zh = {
   "Log in": "登录",
@@ -95,6 +96,13 @@ const state = {
   workspaceDiff: null,
   workspaceFile: null,
   workspaceError: "",
+  terminalCommand: "",
+  terminalCurrent: null,
+  terminalOutput: "",
+  terminalError: "",
+  terminalLoading: false,
+  terminalAbortController: null,
+  lastTerminalEventSequence: null,
   settingsOpen: false,
   sessionToolsOpen: false,
   search: "",
@@ -142,8 +150,14 @@ window.addEventListener("resize", () => {
 document.addEventListener('visibilitychange', onVisibilityChange);
 window.addEventListener('pageshow', onPageResume);
 window.addEventListener('focus', onPageResume);
-window.addEventListener('pagehide', () => stopWorkspaceEvents());
-window.addEventListener('beforeunload', () => stopWorkspaceEvents());
+window.addEventListener('pagehide', () => {
+  stopWorkspaceEvents();
+  stopTerminalStream();
+});
+window.addEventListener('beforeunload', () => {
+  stopWorkspaceEvents();
+  stopTerminalStream();
+});
 
 document.addEventListener("focusin", (event) => {
   if (isFormControl(event.target)) markFormControlInteraction();
@@ -298,6 +312,7 @@ function handleApiError(error, options = {}) {
   if (error?.status === 401 || options.auth) {
     stopStream();
     stopWorkspaceEvents({ clearCursor: true });
+    stopTerminalStream({ clearCursor: true });
     state.token = "";
     state.authSession = null;
     state.currentSession = null;
@@ -732,6 +747,7 @@ function renderWorkspaceInspector() {
       </header>
       ${state.workspaceLoading ? `<div class="workspace-muted">正在读取工作区...</div>` : ""}
       ${state.workspaceError ? `<div class="workspace-error">${escapeHtml(state.workspaceError)}</div>` : ""}
+      ${renderWorkspaceTerminalPanel()}
       ${state.workspaceStatus ? `
         <div class="workspace-status-line">
           <span>${escapeHtml(status.isGitRepository ? (status.branch || "detached") : "非 Git 目录")}</span>
@@ -754,6 +770,37 @@ function renderWorkspaceInspector() {
         </div>
         ${state.workspaceFile ? renderWorkspaceFilePreview() : ""}
       ` : !state.workspaceLoading && !state.workspaceError ? `<div class="workspace-muted">打开后读取当前会话工作区状态。</div>` : ""}
+    </section>
+  `;
+}
+
+function renderWorkspaceTerminalPanel() {
+  const terminal = state.terminalCurrent || {};
+  const running = terminal.status === "running";
+  const busy = state.terminalLoading === true;
+  const hasSession = Boolean(state.currentSession?.id || state.sessionId);
+  const output = state.terminalOutput || "命令输出会显示在这里。";
+  const statusLabel = terminalStatusLabel(terminal.status || (busy ? "starting" : "idle"));
+  return `
+    <section class="workspace-terminal" aria-label="终端">
+      <header>
+        <div>
+          <strong>终端</strong>
+          <small>${escapeHtml(statusLabel)}${terminal.cwd ? ` · ${escapeHtml(terminal.cwd)}` : ""}</small>
+        </div>
+        <button type="button" class="mini-btn" id="clear-terminal" title="清空输出">${icon("refresh")}</button>
+      </header>
+      <form class="terminal-form" id="terminal-form">
+        <input id="terminal-command" type="text" autocomplete="off" spellcheck="false" placeholder="npm test --workspace packages/codex-web" value="${escapeAttribute(state.terminalCommand)}" ${busy || running || !hasSession ? "disabled" : ""}>
+        <button type="submit" class="icon-btn terminal-run" title="运行" ${busy || running || !hasSession ? "disabled" : ""}>${icon("send")}</button>
+        <button type="button" class="icon-btn terminal-stop" id="stop-terminal" title="停止" ${running ? "" : "disabled"}>${icon("stop")}</button>
+      </form>
+      <div class="terminal-actions">
+        <button type="button" class="mini-btn" id="copy-terminal-output" ${state.terminalOutput ? "" : "disabled"}>${icon("clipboard")}复制</button>
+        <button type="button" class="mini-btn" id="append-terminal-output" ${state.terminalOutput ? "" : "disabled"}>${icon("plus")}附加到输入</button>
+      </div>
+      ${state.terminalError ? `<div class="workspace-error">${escapeHtml(state.terminalError)}</div>` : ""}
+      <pre class="terminal-output" id="terminal-output"><code>${escapeHtml(output)}</code></pre>
     </section>
   `;
 }
@@ -797,6 +844,18 @@ function renderWorkspaceFilePreview() {
       <pre><code>${escapeHtml(truncateTimelineText(state.workspaceFile.content || ""))}</code></pre>
     </article>
   `;
+}
+
+function terminalStatusLabel(status) {
+  const labels = {
+    idle: "待运行",
+    starting: "启动中",
+    running: "运行中",
+    completed: "已完成",
+    failed: "失败",
+    stopped: "已停止",
+  };
+  return labels[status] || "待运行";
 }
 
 function renderApprovalActions(approvalId) {
@@ -1670,6 +1729,14 @@ function bindApp(root = document) {
   for (const button of qsa("[data-workspace-file]")) {
     button.addEventListener("click", () => openWorkspaceFile(button.getAttribute("data-workspace-file") || ""));
   }
+  qs("#terminal-form")?.addEventListener("submit", runTerminalCommand);
+  qs("#terminal-command")?.addEventListener("input", (event) => {
+    state.terminalCommand = event.target.value;
+  });
+  qs("#stop-terminal")?.addEventListener("click", stopTerminalCommand);
+  qs("#clear-terminal")?.addEventListener("click", clearTerminalOutput);
+  qs("#copy-terminal-output")?.addEventListener("click", copyTerminalOutput);
+  qs("#append-terminal-output")?.addEventListener("click", appendTerminalOutputToPrompt);
   for (const button of qsa("[data-remove-file]")) {
     button.addEventListener("click", () => {
       const index = Number(button.getAttribute("data-remove-file"));
@@ -2012,6 +2079,252 @@ async function openWorkspaceFile(filePath) {
   }
 }
 
+async function runTerminalCommand(event) {
+  event?.preventDefault?.();
+  const sessionId = state.currentSession?.id || state.sessionId;
+  const input = event?.currentTarget?.querySelector?.("#terminal-command") || document.querySelector("#terminal-command");
+  const command = String(input?.value || state.terminalCommand || "").trim();
+  state.terminalCommand = command;
+  if (!sessionId) {
+    state.terminalError = "请先打开一个会话。";
+    renderTerminalOnly();
+    return;
+  }
+  if (!command) {
+    state.terminalError = "请输入要运行的命令。";
+    renderTerminalOnly();
+    return;
+  }
+  stopTerminalStream({ clearCursor: true });
+  state.terminalLoading = true;
+  state.terminalError = "";
+  state.terminalOutput = "";
+  state.terminalCurrent = { status: "starting" };
+  renderTerminalOnly();
+  try {
+    const payload = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/terminal`, {
+      method: "POST",
+      body: { command },
+    });
+    state.terminalCurrent = payload?.terminal || null;
+    state.terminalLoading = false;
+    renderTerminalOnly();
+    if (payload?.terminal?.id) {
+      void streamTerminalEvents(payload.terminal.id);
+    }
+  } catch (error) {
+    state.terminalLoading = false;
+    state.terminalCurrent = null;
+    state.terminalError = error?.payload?.message || error?.message || "命令启动失败";
+    renderTerminalOnly();
+  }
+}
+
+async function stopTerminalCommand() {
+  const terminalId = state.terminalCurrent?.id;
+  if (!terminalId) return;
+  state.terminalLoading = true;
+  renderTerminalOnly();
+  try {
+    const payload = await apiFetch(`/api/terminals/${encodeURIComponent(terminalId)}/stop`, { method: "POST" });
+    if (payload?.terminal) {
+      state.terminalCurrent = {
+        ...state.terminalCurrent,
+        ...payload.terminal,
+      };
+    }
+    appendTerminalOutput("\n[stop requested]\n");
+  } catch (error) {
+    state.terminalError = error?.payload?.message || error?.message || "停止命令失败";
+  } finally {
+    state.terminalLoading = false;
+    renderTerminalOnly();
+  }
+}
+
+function clearTerminalOutput() {
+  state.terminalOutput = "";
+  state.terminalError = "";
+  renderTerminalOnly();
+}
+
+async function copyTerminalOutput() {
+  const output = state.terminalOutput.trim();
+  if (!output) return;
+  await copyText(output);
+}
+
+function appendTerminalOutputToPrompt() {
+  const output = state.terminalOutput.trim();
+  if (!output) return;
+  const text = output.length > 6000 ? output.slice(-6000) : output;
+  const next = state.prompt
+    ? `${state.prompt}\n\n终端输出:\n${text}`
+    : `终端输出:\n${text}`;
+  if (!setPromptDraft(next, { focus: true })) {
+    render();
+    focusPromptEnd();
+  }
+}
+
+function renderTerminalOnly() {
+  const panel = document.querySelector(".workspace-terminal");
+  if (!panel) {
+    return renderWorkspaceOnly() || render();
+  }
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = renderWorkspaceTerminalPanel().trim();
+  const nextPanel = wrapper.firstElementChild;
+  if (!nextPanel) {
+    return false;
+  }
+  panel.replaceWith(nextPanel);
+  bindApp(nextPanel);
+  syncTerminalOutputScroll();
+  return true;
+}
+
+function stopTerminalStream({ clearCursor = false } = {}) {
+  if (state.terminalAbortController) {
+    state.terminalAbortController.abort();
+    state.terminalAbortController = null;
+  }
+  if (clearCursor) {
+    state.lastTerminalEventSequence = null;
+  }
+}
+
+function resetTerminalState() {
+  stopTerminalStream({ clearCursor: true });
+  state.terminalCurrent = null;
+  state.terminalOutput = "";
+  state.terminalError = "";
+  state.terminalLoading = false;
+}
+
+async function streamTerminalEvents(terminalId) {
+  stopTerminalStream();
+  const controller = new AbortController();
+  state.terminalAbortController = controller;
+  try {
+    const after = state.lastTerminalEventSequence
+      ? `?after=${encodeURIComponent(String(state.lastTerminalEventSequence))}`
+      : "";
+    const response = await fetch(`/api/terminals/${encodeURIComponent(terminalId)}/events${after}`, {
+      headers: { Authorization: `Bearer ${state.token}`, Accept: "text/event-stream" },
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) throw await buildApiError(response);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        processTerminalSseFrame(frame);
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+    if (buffer.trim()) processTerminalSseFrame(buffer);
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    if (error?.status === 401) {
+      handleApiError(error, { auth: true });
+      return;
+    }
+    state.terminalError = error?.payload?.message || error?.message || "终端输出读取失败";
+    renderTerminalOnly();
+  } finally {
+    if (state.terminalAbortController === controller) {
+      state.terminalAbortController = null;
+    }
+  }
+}
+
+function processTerminalSseFrame(frame) {
+  const lines = frame.split(/\r?\n/u);
+  let eventName = "message";
+  const data = [];
+  for (const line of lines) {
+    if (line.startsWith("event:")) eventName = line.slice(6).trim();
+    if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+    if (line.startsWith("id:")) state.lastTerminalEventSequence = line.slice(3).trim();
+  }
+  if (eventName !== "message" || !data.length) return;
+  try {
+    applyTerminalEvent(JSON.parse(data.join("\n")));
+  } catch (_error) {
+  }
+}
+
+function applyTerminalEvent(event) {
+  if (!event || typeof event !== "object") return;
+  if (event.type === "started") {
+    state.terminalCurrent = {
+      ...(state.terminalCurrent || {}),
+      id: event.terminalId,
+      sessionId: event.sessionId,
+      cwd: event.cwd,
+      command: event.command,
+      status: "running",
+    };
+    state.terminalLoading = false;
+    appendTerminalOutput(`$ ${event.command}\n`);
+    renderTerminalOnly();
+    return;
+  }
+  if (event.type === "output") {
+    appendTerminalOutput(event.text || "");
+    return;
+  }
+  if (event.type === "input") {
+    return;
+  }
+  if (event.type === "error") {
+    state.terminalError = event.message || "终端错误";
+    state.terminalCurrent = { ...(state.terminalCurrent || {}), status: "failed" };
+    renderTerminalOnly();
+    return;
+  }
+  if (event.type === "exit") {
+    state.terminalCurrent = {
+      ...(state.terminalCurrent || {}),
+      status: event.status || "completed",
+      exitCode: event.exitCode,
+      signal: event.signal,
+    };
+    appendTerminalOutput(`\n[${event.status || "completed"}${event.exitCode === null || event.exitCode === undefined ? "" : `: ${event.exitCode}`}]\n`);
+    renderTerminalOnly();
+  }
+}
+
+function appendTerminalOutput(text) {
+  if (!text) return;
+  state.terminalOutput = limitTerminalOutput(`${state.terminalOutput || ""}${String(text)}`);
+  const code = document.querySelector("#terminal-output code");
+  if (code) {
+    code.textContent = state.terminalOutput || "命令输出会显示在这里。";
+    syncTerminalOutputScroll();
+  }
+}
+
+function limitTerminalOutput(value) {
+  const text = String(value || "");
+  if (text.length <= TERMINAL_OUTPUT_LIMIT) return text;
+  const hidden = text.length - TERMINAL_OUTPUT_LIMIT;
+  return `[已截断前 ${hidden} 字]\n${text.slice(-TERMINAL_OUTPUT_LIMIT)}`;
+}
+
+function syncTerminalOutputScroll() {
+  const output = document.querySelector("#terminal-output");
+  if (output) output.scrollTop = output.scrollHeight;
+}
+
 async function refreshAdmin({ silent = false } = {}) {
   state.adminLoading = true;
   if (!silent) render();
@@ -2227,6 +2540,7 @@ async function selectSession(sessionId) {
   state.status = "Loading session";
   state.statusTone = "warn";
   stopStream();
+  resetTerminalState();
   render();
   await refreshCurrentSession();
 }
@@ -2527,6 +2841,7 @@ async function recoverActiveTurnAfterForeground() {
 
 async function openNewSession() {
   stopStream();
+  resetTerminalState();
   state.currentSession = null;
   state.sessionId = "";
   state.draftSessionActive = true;
@@ -3099,6 +3414,7 @@ async function logout() {
   }
   stopStream();
   stopWorkspaceEvents({ clearCursor: true });
+  stopTerminalStream({ clearCursor: true });
   state.token = "";
   state.authSession = null;
   state.currentSession = null;

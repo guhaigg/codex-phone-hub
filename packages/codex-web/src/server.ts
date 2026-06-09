@@ -41,6 +41,12 @@ import {
   type CodexWebStoredWorkspaceEvent,
 } from './workspace_event_bus.js';
 import {
+  CodexWebTerminalManager,
+  TerminalManagerError,
+  type CodexWebStoredTerminalEvent,
+  type CodexWebTerminalSummary,
+} from './terminal_manager.js';
+import {
   WorkspaceInspectorError,
   inspectWorkspaceDiff,
   inspectWorkspaceFile,
@@ -66,6 +72,7 @@ export interface CreateCodexWebServerOptions {
   identityStore?: CodexWebIdentityStoreLike | null;
   staticFiles?: StaticFilesRecord;
   workspaceEvents?: CodexWebWorkspaceEventBus;
+  terminalManager?: CodexWebTerminalManager;
 }
 
 export interface CodexWebServerHandle {
@@ -160,6 +167,7 @@ export function createCodexWebServer({
   identityStore = null,
   staticFiles,
   workspaceEvents = new CodexWebWorkspaceEventBus(),
+  terminalManager = new CodexWebTerminalManager(),
 }: CreateCodexWebServerOptions): CodexWebServerHandle {
   const resolvedStaticFiles = staticFiles ?? loadDefaultStaticFiles();
   const activeSseClosers = new Set<() => void>();
@@ -179,6 +187,7 @@ export function createCodexWebServer({
       staticFiles: resolvedStaticFiles,
       config,
       workspaceEvents,
+      terminalManager,
       loginRateLimiter,
       registerSseCloser: (close) => {
         activeSseClosers.add(close);
@@ -226,6 +235,7 @@ export function createCodexWebServer({
       for (const close of [...activeSseClosers]) {
         close();
       }
+      await terminalManager.stopAll();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => {
           if (error) {
@@ -331,6 +341,7 @@ async function handleRequest({
   staticFiles,
   config,
   workspaceEvents,
+  terminalManager,
   loginRateLimiter,
   registerSseCloser,
 }: {
@@ -342,6 +353,7 @@ async function handleRequest({
   staticFiles: StaticFilesRecord;
   config: CodexWebConfig;
   workspaceEvents: CodexWebWorkspaceEventBus;
+  terminalManager: CodexWebTerminalManager;
   loginRateLimiter: FixedWindowRateLimiter;
   registerSseCloser: (close: () => void) => () => void;
 }): Promise<void> {
@@ -449,6 +461,7 @@ async function handleRequest({
       runtime,
       config,
       workspaceEvents,
+      terminalManager,
       registerSseCloser,
     });
     if (handled) {
@@ -729,6 +742,96 @@ async function handleRequest({
     const session = await runtime.createSession(body as CreateSessionInput);
     appendWorkspaceSessionEvent(workspaceEvents, 'session.created', singleUserWorkspaceContext(session.id));
     writeJson(response, 201, { session });
+    return;
+  }
+
+  const startTerminalMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/terminal$/u);
+  if (startTerminalMatch && method === 'POST') {
+    const sessionId = decodeURIComponent(startTerminalMatch[1]!);
+    const session = await runtime.readSession(sessionId);
+    if (!session) {
+      writeSessionNotFound(response);
+      return;
+    }
+    const rootCwd = normalizeOptionalString(session.cwd);
+    if (!rootCwd) {
+      writeJson(response, 404, {
+        error: 'workspace_not_found',
+        message: 'Session has no workspace cwd.',
+      });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const command = normalizeOptionalString(body.command);
+    if (!command) {
+      writeJson(response, 400, {
+        error: 'terminal_command_required',
+        message: 'command is required',
+      });
+      return;
+    }
+    const terminal = await terminalManager.start({
+      sessionId,
+      threadId: normalizeOptionalString(session.id) || sessionId,
+      cwd: normalizeOptionalString(body.cwd) || rootCwd,
+      rootCwd,
+      command,
+    });
+    writeJson(response, 201, { terminal });
+    return;
+  }
+
+  if (pathname === '/api/terminals' && method === 'GET') {
+    writeJson(response, 200, {
+      items: terminalManager.list({
+        sessionId: normalizeOptionalString(url.searchParams.get('sessionId')) || null,
+      }),
+    });
+    return;
+  }
+
+  const terminalEventsMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/events$/u);
+  if (terminalEventsMatch && method === 'GET') {
+    await streamTerminalEvents({
+      request,
+      response,
+      terminalManager,
+      terminalId: decodeURIComponent(terminalEventsMatch[1]!),
+      afterId: normalizeLastEventId(url.searchParams.get('after'), request.headers['last-event-id']),
+      registerSseCloser,
+    });
+    return;
+  }
+
+  const terminalInputMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/input$/u);
+  if (terminalInputMatch && method === 'POST') {
+    const body = await readJsonBody(request);
+    if (typeof body.text !== 'string') {
+      writeJson(response, 400, {
+        error: 'terminal_input_required',
+        message: 'text is required',
+      });
+      return;
+    }
+    terminalManager.writeInput(decodeURIComponent(terminalInputMatch[1]!), body.text);
+    writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  const terminalResizeMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/resize$/u);
+  if (terminalResizeMatch && method === 'POST') {
+    const terminal = terminalManager.get(decodeURIComponent(terminalResizeMatch[1]!));
+    if (!terminal) {
+      throw new TerminalManagerError('terminal_not_found', 'terminal not found', 404);
+    }
+    writeJson(response, 200, { ok: true, terminal });
+    return;
+  }
+
+  const terminalStopMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/stop$/u);
+  if (terminalStopMatch && method === 'POST') {
+    const terminal = await terminalManager.stop(decodeURIComponent(terminalStopMatch[1]!));
+    writeJson(response, 200, { terminal });
     return;
   }
 
@@ -1249,6 +1352,7 @@ async function handleMultiUserRequest({
   runtime,
   config,
   workspaceEvents,
+  terminalManager,
   registerSseCloser,
 }: {
   request: IncomingMessage;
@@ -1264,6 +1368,7 @@ async function handleMultiUserRequest({
   runtime: CodexWebRuntime;
   config: CodexWebConfig;
   workspaceEvents: CodexWebWorkspaceEventBus;
+  terminalManager: CodexWebTerminalManager;
   registerSseCloser: (close: () => void) => () => void;
 }): Promise<boolean> {
   if (pathname === '/api/auth/me' || pathname === '/api/auth/logout') {
@@ -1542,6 +1647,141 @@ async function handleMultiUserRequest({
       });
       return true;
     }
+  }
+
+  const startTerminalMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/terminal$/u);
+  if (startTerminalMatch && method === 'POST') {
+    const sessionId = decodeURIComponent(startTerminalMatch[1]!);
+    const stateForSession = await stateForSessionAccess({
+      identityStore,
+      identityState,
+      runtime,
+      principal,
+      sessionId,
+    });
+    const resolved = resolveWritableAppSession(stateForSession, principal, sessionId);
+    if (!resolved) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    if (rejectArchivedSessionWrite(response, resolved.appSession)) {
+      return true;
+    }
+    const body = await readJsonBody(request);
+    const command = normalizeOptionalString(body.command);
+    if (!command) {
+      writeJson(response, 400, {
+        error: 'terminal_command_required',
+        message: 'command is required',
+      });
+      return true;
+    }
+    const runtimeSession = resolved.project?.cwd ? null : await runtime.readSession(resolved.appSession.codexThreadId);
+    const rootCwd = normalizeOptionalString(resolved.project?.cwd) || normalizeOptionalString(runtimeSession?.cwd);
+    if (!rootCwd) {
+      writeJson(response, 404, {
+        error: 'workspace_not_found',
+        message: 'Session has no workspace cwd.',
+      });
+      return true;
+    }
+    const terminal = await terminalManager.start({
+      sessionId: resolved.appSession.id,
+      appSessionId: resolved.appSession.id,
+      threadId: resolved.appSession.codexThreadId,
+      projectId: resolved.appSession.projectId,
+      ownerUserId: resolved.appSession.ownerUserId,
+      cwd: normalizeOptionalString(body.cwd) || rootCwd,
+      rootCwd,
+      command,
+    });
+    await identityStore.upsertSession({
+      ...resolved.appSession,
+      updatedAt: new Date().toISOString(),
+    });
+    writeJson(response, 201, { terminal });
+    return true;
+  }
+
+  if (pathname === '/api/terminals' && method === 'GET') {
+    const stateForTerminals = principal.isAdmin
+      ? await ensureAdminLegacySessionMappings({
+        identityStore,
+        identityState,
+        runtime,
+        principal,
+      })
+      : identityState;
+    const sessionIdFilter = normalizeOptionalString(url.searchParams.get('sessionId'));
+    const items = terminalManager.list()
+      .filter((terminal) => matchesTerminalSessionFilter(terminal, sessionIdFilter))
+      .filter((terminal) => canReadTerminalSummary(stateForTerminals, principal, terminal));
+    writeJson(response, 200, { items });
+    return true;
+  }
+
+  const terminalEventsMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/events$/u);
+  if (terminalEventsMatch && method === 'GET') {
+    const terminalId = decodeURIComponent(terminalEventsMatch[1]!);
+    const terminal = terminalManager.get(terminalId);
+    if (!terminal || !canReadTerminalSummary(identityState, principal, terminal)) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    await streamTerminalEvents({
+      request,
+      response,
+      terminalManager,
+      terminalId,
+      afterId: normalizeLastEventId(url.searchParams.get('after'), request.headers['last-event-id']),
+      registerSseCloser,
+    });
+    return true;
+  }
+
+  const terminalInputMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/input$/u);
+  if (terminalInputMatch && method === 'POST') {
+    const terminalId = decodeURIComponent(terminalInputMatch[1]!);
+    const terminal = terminalManager.get(terminalId);
+    if (!terminal || !canWriteTerminalSummary(identityState, principal, terminal)) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    const body = await readJsonBody(request);
+    if (typeof body.text !== 'string') {
+      writeJson(response, 400, {
+        error: 'terminal_input_required',
+        message: 'text is required',
+      });
+      return true;
+    }
+    terminalManager.writeInput(terminalId, body.text);
+    writeJson(response, 200, { ok: true });
+    return true;
+  }
+
+  const terminalResizeMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/resize$/u);
+  if (terminalResizeMatch && method === 'POST') {
+    const terminalId = decodeURIComponent(terminalResizeMatch[1]!);
+    const terminal = terminalManager.get(terminalId);
+    if (!terminal || !canWriteTerminalSummary(identityState, principal, terminal)) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    writeJson(response, 200, { ok: true, terminal });
+    return true;
+  }
+
+  const terminalStopMatch = pathname.match(/^\/api\/terminals\/([^/]+)\/stop$/u);
+  if (terminalStopMatch && method === 'POST') {
+    const terminalId = decodeURIComponent(terminalStopMatch[1]!);
+    const terminal = terminalManager.get(terminalId);
+    if (!terminal || !canWriteTerminalSummary(identityState, principal, terminal)) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    writeJson(response, 200, { terminal: await terminalManager.stop(terminalId) });
+    return true;
   }
 
   const shareCreateMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/share$/u);
@@ -2291,6 +2531,55 @@ function canWriteResolvedAppSession(
   appSession: CodexWebAppSession,
 ): boolean {
   return canWriteAppSession(state, principal, appSession);
+}
+
+function matchesTerminalSessionFilter(terminal: CodexWebTerminalSummary, sessionId: string): boolean {
+  if (!sessionId) {
+    return true;
+  }
+  return terminal.sessionId === sessionId
+    || terminal.threadId === sessionId
+    || terminal.appSessionId === sessionId;
+}
+
+function canReadTerminalSummary(
+  state: CodexWebIdentityState,
+  principal: CodexWebPrincipal,
+  terminal: CodexWebTerminalSummary,
+): boolean {
+  const appSession = terminalAppSessionForSummary(state, terminal);
+  if (appSession) {
+    return canReadWorkspaceAppSession(state, principal, appSession);
+  }
+  return false;
+}
+
+function canWriteTerminalSummary(
+  state: CodexWebIdentityState,
+  principal: CodexWebPrincipal,
+  terminal: CodexWebTerminalSummary,
+): boolean {
+  const appSession = terminalAppSessionForSummary(state, terminal);
+  if (appSession) {
+    return canWriteResolvedAppSession(state, principal, appSession);
+  }
+  return false;
+}
+
+function terminalAppSessionForSummary(
+  state: CodexWebIdentityState,
+  terminal: CodexWebTerminalSummary,
+): CodexWebAppSession | null {
+  return [
+    terminal.appSessionId,
+    terminal.sessionId,
+    terminal.threadId,
+  ]
+    .map(normalizeOptionalString)
+    .filter(Boolean)
+    .map((sessionId) => findAppSessionByExternalId(state, sessionId))
+    .find((session): session is CodexWebAppSession => Boolean(session))
+    ?? null;
 }
 
 function isObserverSessionForPrincipal(
@@ -3513,6 +3802,86 @@ async function streamTurnEvents({
   response.once('error', cleanup);
 }
 
+async function streamTerminalEvents({
+  request,
+  response,
+  terminalManager,
+  terminalId,
+  afterId,
+  registerSseCloser,
+}: {
+  request: IncomingMessage;
+  response: ServerResponse;
+  terminalManager: CodexWebTerminalManager;
+  terminalId: string;
+  afterId?: string | number | null;
+  registerSseCloser: (close: () => void) => () => void;
+}): Promise<void> {
+  const terminal = terminalManager.get(terminalId);
+  if (!terminal) {
+    throw new TerminalManagerError('terminal_not_found', 'terminal not found', 404);
+  }
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+    Connection: 'keep-alive',
+  });
+
+  const writeEvent = (entry: CodexWebStoredTerminalEvent) => {
+    response.write(`id: ${entry.sequence}\n`);
+    response.write('event: message\n');
+    response.write(`data: ${JSON.stringify(entry.event)}\n\n`);
+  };
+
+  for (const entry of terminalManager.getEvents(terminalId, afterId)) {
+    writeEvent(entry);
+  }
+
+  if (terminalManager.get(terminalId)?.status !== 'running') {
+    response.end();
+    return;
+  }
+
+  let closed = false;
+  let unregisterForcedClose: (() => void) | null = null;
+  let unsubscribe: (() => void) | null = null;
+  const heartbeat = setInterval(() => {
+    response.write(': keepalive\n\n');
+  }, 15_000);
+
+  const cleanup = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe?.();
+    unsubscribe = null;
+    unregisterForcedClose?.();
+    unregisterForcedClose = null;
+    if (!response.writableEnded && !response.destroyed) {
+      response.end();
+    }
+  };
+
+  unsubscribe = terminalManager.subscribe(terminalId, (entry) => {
+    writeEvent(entry);
+    if (entry.event.type === 'exit') {
+      cleanup();
+    }
+  });
+
+  unregisterForcedClose = registerSseCloser(() => {
+    cleanup();
+    request.socket.destroy();
+  });
+
+  request.once('close', cleanup);
+  request.once('aborted', cleanup);
+  response.once('close', cleanup);
+  response.once('error', cleanup);
+}
+
 async function streamWorkspaceEvents({
   request,
   response,
@@ -3687,6 +4056,21 @@ function writeErrorResponse({
       message: error.message,
     });
     writeJson(response, error.statusCode, {
+      error: error.code,
+      message: error.message,
+    });
+    return;
+  }
+  if (error instanceof TerminalManagerError) {
+    writeRequestLog({
+      level: error.status >= 500 ? 'error' : 'warn',
+      method: request.method ?? 'GET',
+      path: request.url ?? '/',
+      status: error.status,
+      code: error.code,
+      message: error.message,
+    });
+    writeJson(response, error.status, {
       error: error.code,
       message: error.message,
     });

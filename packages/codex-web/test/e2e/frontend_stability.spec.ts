@@ -126,6 +126,39 @@ test('desktop workbench and settings navigation do not replace the sidebar shell
   expect(await searchHandle!.evaluate((node) => node.isConnected)).toBe(true);
 });
 
+test('desktop workspace terminal runs a command without freezing the composer', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const sessionLoaded = page.waitForResponse((response) => (
+    response.url().endsWith('/api/sessions/session_existing')
+    && response.status() === 200
+  ));
+  await page.locator('[data-session-open="session_existing"]').click();
+  await sessionLoaded;
+  await expect(page.locator('#prompt-input')).toBeVisible();
+
+  const workspaceLoaded = page.waitForResponse((response) => (
+    response.url().includes('/api/sessions/session_existing/workspace/status')
+    && response.status() === 200
+  ));
+  await page.locator('#toggle-workspace').click();
+  await workspaceLoaded;
+  await expect(page.locator('.workspace-terminal')).toBeVisible();
+
+  const command = `${process.execPath} -e "console.log('e2e-terminal-ok')"`;
+  const terminalStarted = page.waitForResponse((response) => (
+    response.url().endsWith('/api/sessions/session_existing/terminal')
+    && response.status() === 201
+  ));
+  await page.locator('#terminal-command').fill(command);
+  await page.locator('#terminal-form').evaluate((form: HTMLFormElement) => form.requestSubmit());
+  await terminalStarted;
+  await expect(page.locator('#terminal-output')).toContainText('e2e-terminal-ok');
+
+  const prompt = page.locator('#prompt-input');
+  await prompt.fill('终端运行后仍可输入');
+  await expect(prompt).toHaveValue('终端运行后仍可输入');
+});
+
 test('mobile new conversation and refresh keep the composer usable', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.reload();
