@@ -108,6 +108,22 @@ The response is intentionally non-fatal for third-party API setups: official
 usage being unavailable is reported as diagnostics, not as a Codex runtime
 failure.
 
+## Context packages
+
+Authenticated clients can generate a bounded Markdown handoff package for the
+current session:
+
+```text
+GET /api/sessions/:sessionId/context-package
+```
+
+The package includes session metadata, cwd, model/settings, Git dirty counts,
+changed file paths, diff file/hunk summaries, and artifact metadata. It does not
+include prompt transcripts, raw diff text, file contents, terminal input/output,
+passwords, bearer tokens, or provider secrets. The web UI exposes this as
+"交接包" actions for inserting into the composer, copying, or starting a new
+session draft.
+
 ## Security audit and devices
 
 Audit records are append-only JSONL under the configured state directory:
@@ -132,7 +148,8 @@ GET /api/admin/audit?cursor=&limit=&actor=&project=&action=
 The settings page shows this as the personal "我的设备" and "操作记录" sections.
 Audit metadata intentionally excludes passwords, bearer tokens, prompt text,
 configuration values, uploaded file contents, terminal input text, and terminal
-output.
+output. Context package reads are audited as `session.context_package.read` with
+counts only, not the generated Markdown.
 
 ## Backups and upgrades
 

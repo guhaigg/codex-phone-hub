@@ -15,6 +15,17 @@ export {
 } from './access_control.js';
 export { loadServiceConfig, readEnvFile, type CodexWebConfig } from './config.js';
 export {
+  CONTEXT_PACKAGE_ARTIFACT_LIMIT,
+  CONTEXT_PACKAGE_DIFF_FILE_LIMIT,
+  CONTEXT_PACKAGE_FILE_LIMIT,
+  buildSessionContextPackage,
+  type CodexWebContextPackageArtifact,
+  type CodexWebContextPackageDiffFile,
+  type CodexWebContextPackageFile,
+  type CodexWebContextPackageInput,
+  type CodexWebSessionContextPackage,
+} from './context_package.js';
+export {
   CodexWebEventBus,
   type CodexWebEventListener,
   type CodexWebStoredEvent,

@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 import { FileIdentityStore } from '../src/identity_store.js';
 import { createCodexWebServer } from '../src/server.js';
 import { CodexWebWorkspaceEventBus } from '../src/workspace_event_bus.js';
 import { FileArtifactStore } from '../src/artifact_store.js';
 import { FileAuditStore } from '../src/audit_store.js';
+
+const execFileAsync = promisify(execFile);
 
 interface TestConfig {
   host: string;
@@ -71,6 +75,11 @@ function createRuntimeStub() {
     getTurnEvents: () => [],
     subscribeToTurn: () => () => {},
   };
+}
+
+async function git(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync('git', args, { cwd });
+  return stdout.trim();
 }
 
 test('API routes reject missing bearer token', async () => {
@@ -501,6 +510,85 @@ test('GET /api/sessions/:sessionId/workspace/files rejects path traversal', asyn
   } finally {
     await server.stop();
     await fs.rm(projectDir, { recursive: true, force: true });
+  }
+});
+
+test('GET /api/sessions/:sessionId/context-package returns a bounded handoff package and audits the read', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-context-package-'));
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-web-context-project-'));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    await fs.rm(projectDir, { recursive: true, force: true });
+  });
+  await git(projectDir, ['init']);
+  await git(projectDir, ['config', 'user.email', 'codex-web@example.test']);
+  await git(projectDir, ['config', 'user.name', 'Codex Web']);
+  await fs.writeFile(path.join(projectDir, 'README.md'), 'base\n', 'utf8');
+  await git(projectDir, ['add', 'README.md']);
+  await git(projectDir, ['commit', '-m', 'initial commit']);
+  await fs.writeFile(path.join(projectDir, 'README.md'), 'base\nSECRET_TOKEN_SHOULD_NOT_LEAK\n', 'utf8');
+  await fs.mkdir(path.join(projectDir, 'dist'), { recursive: true });
+  await fs.writeFile(path.join(projectDir, 'dist', 'summary.md'), '# Summary\n', 'utf8');
+
+  const auditStore = new FileAuditStore({ auditPath: path.join(stateDir, 'audit-log.jsonl') });
+  const server = createCodexWebServer({
+    auth: createAcceptingAuth(),
+    runtime: {
+      ...createRuntimeStub(),
+      readSession: async () => ({
+        id: 'thread_1',
+        title: 'Context package session',
+        cwd: projectDir,
+        projectName: 'context-project',
+        settings: {
+          model: 'third-party-model',
+          reasoningEffort: 'high',
+          sandboxMode: 'workspace-write',
+          approvalPolicy: 'never',
+          collaborationMode: 'default',
+        },
+        preview: 'prompt text should stay out',
+        timeline: [{ kind: 'message', role: 'assistant', text: 'assistant text should stay out' }],
+      }),
+    } as any,
+    config: createConfig({ stateDir }),
+    auditStore,
+  });
+  await server.start();
+  try {
+    const response = await fetch(`${server.baseUrl}/api/sessions/thread_1/context-package`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+
+    assert.equal(response.status, 200);
+    const payload = await response.json() as any;
+    assert.equal(payload.package.sessionId, 'thread_1');
+    assert.match(payload.package.markdown, /# Codex 交接包/u);
+    assert.match(payload.package.markdown, /Context package session/u);
+    assert.match(payload.package.markdown, /third-party-model/u);
+    assert.match(payload.package.markdown, /README\.md/u);
+    assert.match(payload.package.markdown, /dist\/summary\.md/u);
+    assert.match(payload.package.markdown, /Diff 摘要/u);
+    assert.doesNotMatch(payload.package.markdown, /SECRET_TOKEN_SHOULD_NOT_LEAK/u);
+    assert.doesNotMatch(payload.package.markdown, /prompt text/u);
+    assert.doesNotMatch(payload.package.markdown, /assistant text/u);
+
+    const auditResponse = await fetch(`${server.baseUrl}/api/admin/audit?limit=5`, {
+      headers: { Authorization: 'Bearer cw_token' },
+    });
+    assert.equal(auditResponse.status, 200);
+    const auditPayload = await auditResponse.json() as any;
+    const audit = auditPayload.items.find((item: any) => item.action === 'session.context_package.read');
+    assert.ok(audit);
+    assert.equal(audit.codexSessionId, 'thread_1');
+    assert.equal(audit.metadata.hasWorkspace, true);
+    assert.equal(audit.metadata.fileCount >= 1, true);
+    assert.equal(audit.metadata.artifactCount >= 1, true);
+    const rawAudit = JSON.stringify(audit);
+    assert.doesNotMatch(rawAudit, /SECRET_TOKEN_SHOULD_NOT_LEAK/u);
+    assert.doesNotMatch(rawAudit, /# Codex 交接包/u);
+  } finally {
+    await server.stop();
   }
 });
 

@@ -60,6 +60,10 @@ import {
 } from './workspace_inspector.js';
 import { collectDiagnosticsSummary } from './diagnostics.js';
 import { FileAuditStore, type CodexWebAuditRecordInput } from './audit_store.js';
+import {
+  buildSessionContextPackage,
+  type CodexWebSessionContextPackage,
+} from './context_package.js';
 
 export interface CodexWebAuthLike {
   isConfigured(): Promise<boolean>;
@@ -1080,6 +1084,30 @@ async function handleRequest({
       action: sessionWorkspaceMatch[2] as 'status' | 'diff' | 'files',
       filePath: url.searchParams.get('path'),
     });
+    return;
+  }
+
+  const sessionContextPackageMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/context-package$/u);
+  if (sessionContextPackageMatch && method === 'GET') {
+    const sessionId = decodeURIComponent(sessionContextPackageMatch[1]!);
+    const session = await runtime.readSession(sessionId);
+    if (!session) {
+      writeSessionNotFound(response);
+      return;
+    }
+    const contextPackage = await buildContextPackageForRuntimeSession({
+      sessionId,
+      session,
+      artifactStore,
+    });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.context_package.read',
+      sessionId: authContext.session.id,
+      codexSessionId: sessionId,
+      projectId: contextPackage.session.projectId,
+      metadata: contextPackageAuditMetadata(contextPackage),
+    }));
+    writeJson(response, 200, { package: contextPackage });
     return;
   }
 
@@ -2370,6 +2398,34 @@ async function handleMultiUserRequest({
       action: sessionWorkspaceMatch[2] as 'status' | 'diff' | 'files',
       filePath: url.searchParams.get('path'),
     });
+    return true;
+  }
+
+  const sessionContextPackageMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/context-package$/u);
+  if (sessionContextPackageMatch && method === 'GET') {
+    const resolved = resolveReadableWorkspaceAppSession(identityState, principal, decodeURIComponent(sessionContextPackageMatch[1]!));
+    if (!resolved) {
+      writeSessionNotFound(response);
+      return true;
+    }
+    const artifactStore = createArtifactStore(config);
+    const contextPackage = await buildContextPackageForAppSession({
+      runtime,
+      appSession: resolved.appSession,
+      project: resolved.project,
+      artifactStore,
+    });
+    await recordAuditSafe(auditStore, auditInputFromPrincipal(principal, {
+      action: 'session.context_package.read',
+      sessionId: authContext.session.id,
+      projectId: resolved.appSession.projectId,
+      codexSessionId: resolved.appSession.codexThreadId,
+      metadata: {
+        appSessionId: resolved.appSession.id,
+        ...contextPackageAuditMetadata(contextPackage),
+      },
+    }));
+    writeJson(response, 200, { package: contextPackage });
     return true;
   }
 
@@ -4519,6 +4575,96 @@ function classifyProviderHealthError(error: unknown): 'auth_missing' | 'unsuppor
 
 function messageFromUnknown(error: unknown): string {
   return error instanceof Error ? error.message : String(error || '');
+}
+
+async function buildContextPackageForRuntimeSession({
+  sessionId,
+  session,
+  artifactStore,
+}: {
+  sessionId: string;
+  session: CodexWebSession;
+  artifactStore: FileArtifactStore;
+}): Promise<CodexWebSessionContextPackage> {
+  const artifactInput = artifactInputFromRuntimeSession(sessionId, session);
+  const cwd = normalizeOptionalString(artifactInput.projectCwd);
+  const [workspaceStatus, workspaceDiff, artifacts] = await Promise.all([
+    cwd ? inspectWorkspaceStatus(cwd).catch(() => null) : Promise.resolve(null),
+    cwd ? inspectWorkspaceDiff(cwd).catch(() => null) : Promise.resolve(null),
+    safeListContextArtifacts(artifactStore, artifactInput),
+  ]);
+  return buildSessionContextPackage({
+    session: {
+      ...session,
+      id: normalizeOptionalString(session.id) || sessionId,
+      cwd: normalizeOptionalString(session.cwd) || cwd || null,
+      projectId: artifactInput.projectId,
+    },
+    workspaceStatus,
+    workspaceDiff,
+    artifacts,
+  });
+}
+
+async function buildContextPackageForAppSession({
+  runtime,
+  appSession,
+  project,
+  artifactStore,
+}: {
+  runtime: CodexWebRuntime;
+  appSession: CodexWebAppSession;
+  project: CodexWebProject | null;
+  artifactStore: FileArtifactStore;
+}): Promise<CodexWebSessionContextPackage> {
+  const [runtimeSession, artifactInput] = await Promise.all([
+    runtime.readSession(appSession.codexThreadId).catch(() => null),
+    artifactInputFromAppSession({ runtime, appSession, project }),
+  ]);
+  const cwd = normalizeOptionalString(artifactInput.projectCwd);
+  const [workspaceStatus, workspaceDiff, artifacts] = await Promise.all([
+    cwd ? inspectWorkspaceStatus(cwd).catch(() => null) : Promise.resolve(null),
+    cwd ? inspectWorkspaceDiff(cwd).catch(() => null) : Promise.resolve(null),
+    safeListContextArtifacts(artifactStore, artifactInput),
+  ]);
+  return buildSessionContextPackage({
+    session: {
+      ...(runtimeSession || {}),
+      id: appSession.id,
+      title: normalizeOptionalString(runtimeSession?.title) || appSession.codexThreadId,
+      cwd: cwd || null,
+      projectId: appSession.projectId,
+    },
+    workspaceStatus,
+    workspaceDiff,
+    artifacts,
+  });
+}
+
+async function safeListContextArtifacts(
+  artifactStore: FileArtifactStore,
+  input: ListArtifactsInput,
+): Promise<Awaited<ReturnType<FileArtifactStore['listForSession']>>> {
+  try {
+    return await artifactStore.listForSession(input);
+  } catch (error) {
+    if (error instanceof ArtifactStoreError) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+function contextPackageAuditMetadata(contextPackage: CodexWebSessionContextPackage): Record<string, unknown> {
+  return {
+    hasWorkspace: Boolean(contextPackage.workspace),
+    fileCount: contextPackage.workspace?.files.length || 0,
+    omittedFiles: contextPackage.workspace?.omittedFiles || 0,
+    diffFileCount: contextPackage.workspace?.diffFiles.length || 0,
+    omittedDiffFiles: contextPackage.workspace?.omittedDiffFiles || 0,
+    artifactCount: contextPackage.artifacts.length,
+    omittedArtifacts: contextPackage.omittedArtifacts,
+  };
 }
 
 function createArtifactStore(config: CodexWebConfig): FileArtifactStore {

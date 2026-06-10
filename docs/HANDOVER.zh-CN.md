@@ -338,7 +338,31 @@ POST /api/sessions/:id/turns
 
 审计只保存操作元数据，不保存 Web 密码、Bearer token、prompt 正文、配置值、上传文件内容、终端输入正文或终端输出。
 
-### 6.5 移动端稳定性修复
+### 6.5 交接包
+
+会话页和工作区面板提供 `交接包` 操作：
+
+- 插入交接包：把当前会话上下文追加到输入框。
+- 复制交接包：复制 Markdown 到剪贴板。
+- 新会话继续：打开新会话草稿并填入交接包。
+
+接口：
+
+```text
+GET /api/sessions/:sessionId/context-package
+```
+
+交接包包含会话 ID、标题、cwd、模型/推理/沙箱/审批设置、Git 分支、dirty 计数、变更文件路径、diff 文件/hunk 摘要、artifact 列表。交接包不包含 prompt 正文、assistant 输出、原始 diff、文件内容、终端输入/输出、密码、Bearer token 或 provider secret。
+
+审计动作：
+
+```text
+session.context_package.read
+```
+
+审计 metadata 只记录是否有 workspace、文件数、diff 文件数、artifact 数，不保存生成的 Markdown。
+
+### 6.6 移动端稳定性修复
 
 已修复设置页/管理页下拉框闪屏、卡住、打不开问题：
 

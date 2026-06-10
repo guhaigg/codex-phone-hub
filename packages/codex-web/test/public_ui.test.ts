@@ -3075,6 +3075,56 @@ test('desktop workspace inspector button loads git status and diff for the activ
   assert.match(html, /\+new/u);
 });
 
+test('context package insert fills the focused composer without replacing the input node', async () => {
+  const fetchCalls: string[] = [];
+  const { api, context } = await loadAppHarness({
+    viewportWidth: 1440,
+    desktopPointer: true,
+    fetch: async (path) => {
+      fetchCalls.push(String(path));
+      if (path === '/api/sessions/session_1/context-package') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            package: {
+              sessionId: 'session_1',
+              markdown: '# Codex 交接包\n\n- 工作目录：/repo\n- Git：main -> origin/main\n',
+            },
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    },
+  });
+
+  api.state.token = 'token';
+  api.state.authSession = { principal: { username: 'admin' } };
+  api.state.view = 'chat';
+  api.state.sessionId = 'session_1';
+  api.state.currentSession = { id: 'session_1', title: 'Workspace session', cwd: '/repo' };
+  api.state.prompt = '继续当前任务';
+
+  api.render();
+  const promptInput = context.document.querySelector('#prompt-input');
+  assert.ok(promptInput);
+  promptInput.value = '继续当前任务';
+  promptInput.focus();
+  const renderCountBefore = context.__appRenderCount;
+
+  assert.equal(typeof api.handleContextPackageAction, 'function');
+  await api.handleContextPackageAction('insert');
+  await flushMicrotasks();
+
+  assert.deepEqual(fetchCalls, ['/api/sessions/session_1/context-package']);
+  assert.equal(context.document.querySelector('#prompt-input'), promptInput);
+  assert.equal(context.document.activeElement, promptInput);
+  assert.equal(context.__appRenderCount, renderCountBefore);
+  assert.match(promptInput.value, /继续当前任务/u);
+  assert.match(promptInput.value, /# Codex 交接包/u);
+  assert.match(promptInput.value, /\/repo/u);
+});
+
 test('desktop notebook chat uses canvas stage and floating tray composer', async () => {
   const { api, context } = await loadAppHarness({
     viewportWidth: 1440,
@@ -10810,6 +10860,7 @@ globalThis.__codexWebTest = {
   openNewSessionPage: typeof openNewSessionPage === 'function' ? openNewSessionPage : null,
   shareCurrentSession: typeof shareCurrentSession === 'function' ? shareCurrentSession : null,
   copyShareLink: typeof copyShareLink === 'function' ? copyShareLink : null,
+  handleContextPackageAction: typeof handleContextPackageAction === 'function' ? handleContextPackageAction : null,
 	  openReportById: typeof openReportById === 'function' ? openReportById : null,
 	  closeReportViewer: typeof closeReportViewer === 'function' ? closeReportViewer : null,
   openReportByPath: typeof openReportByPath === 'function' ? openReportByPath : null,

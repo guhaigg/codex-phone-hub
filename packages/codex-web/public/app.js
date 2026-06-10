@@ -79,6 +79,7 @@ const state = {
   authSessions: [],
   auditItems: [],
   securityLoading: false,
+  contextPackageLoading: false,
   model: "",
   view: "sessions",
   isMobile: window.innerWidth < 820,
@@ -657,6 +658,7 @@ function renderChatOrEmpty(mobile) {
         </div>
         <button class="icon-btn" id="toggle-session-tools" title="能力">${icon("sliders")}</button>
         <button class="icon-btn" id="toggle-workspace" title="工作区">${icon("folder")}</button>
+        <button class="icon-btn" type="button" data-context-package-action="insert" title="插入交接包" ${state.contextPackageLoading ? "disabled" : ""}>${icon("clipboard")}</button>
         ${state.currentSession?.id ? `<button class="icon-btn" id="share-session" title="分享">${icon("share")}</button>` : ""}
         <button class="icon-btn" id="refresh-session" title="刷新">${icon("refresh")}</button>
       </header>
@@ -755,6 +757,7 @@ function renderWorkspaceInspector() {
           <strong>工作区</strong>
           <small>${escapeHtml(status.cwd || state.currentSession?.cwd || workspaceLabel())}</small>
         </div>
+        <button type="button" class="mini-btn context-package-mini" data-context-package-action="insert" title="插入交接包" ${state.contextPackageLoading ? "disabled" : ""}>${icon("clipboard")}交接包</button>
         <button type="button" class="mini-btn" id="refresh-workspace" title="刷新">${icon("refresh")}</button>
       </header>
       ${state.workspaceLoading ? `<div class="workspace-muted">正在读取工作区...</div>` : ""}
@@ -1148,6 +1151,9 @@ function renderSessionTools() {
           <button type="button" id="save-session-settings">${canPatch ? "保存本会话" : "保存为默认"}</button>
           <button type="button" data-command="/help">/help</button>
           <button type="button" data-command="/goal">/goal</button>
+          <button type="button" data-context-package-action="insert" ${canPatch && !state.contextPackageLoading ? "" : "disabled"}>插入交接包</button>
+          <button type="button" data-context-package-action="copy" ${canPatch && !state.contextPackageLoading ? "" : "disabled"}>复制交接包</button>
+          <button type="button" data-context-package-action="new" ${canPatch && !state.contextPackageLoading ? "" : "disabled"}>新会话继续</button>
           <button type="button" id="session-favorite">${isFavorite(state.currentSession) ? "取消收藏" : "收藏"}</button>
           <button type="button" id="session-archive">${state.currentSession?.archived ? "取消归档" : "归档"}</button>
         </div>
@@ -2021,6 +2027,13 @@ function bindApp(root = document) {
       });
     });
   }
+  for (const button of qsa("[data-context-package-action]")) {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void handleContextPackageAction(button.getAttribute("data-context-package-action") || "insert");
+    });
+  }
   for (const button of qsa("[data-copy-text]")) {
     button.addEventListener("click", async () => {
       await copyText(button.getAttribute("data-copy-text") || "");
@@ -2520,6 +2533,67 @@ async function refreshWorkspaceInspector() {
     state.workspaceLoading = false;
     renderAfterBackgroundRefresh();
   }
+}
+
+async function loadSessionContextPackage() {
+  const sessionId = currentSessionId();
+  const preserveFocusedPrompt = isPromptInputFocused();
+  if (!sessionId) {
+    state.notice = "请先打开一个会话再生成交接包";
+    if (!preserveFocusedPrompt && !isFormControlInteractionActive()) render();
+    return null;
+  }
+  state.contextPackageLoading = true;
+  state.notice = "正在生成交接包";
+  if (!preserveFocusedPrompt && !isFormControlInteractionActive()) renderWorkspaceOnly() || render();
+  try {
+    const payload = await apiFetch(`/api/sessions/${encodeURIComponent(sessionId)}/context-package`);
+    return payload?.package || null;
+  } catch (error) {
+    state.notice = error?.payload?.message || error?.message || "交接包生成失败";
+    state.error = state.notice;
+    return null;
+  } finally {
+    state.contextPackageLoading = false;
+    if (!preserveFocusedPrompt && !isFormControlInteractionActive()) renderWorkspaceOnly() || render();
+  }
+}
+
+async function handleContextPackageAction(action = "insert") {
+  const activeInput = document.querySelector("#prompt-input");
+  const contextPackage = await loadSessionContextPackage();
+  const markdown = String(contextPackage?.markdown || "").trim();
+  if (!markdown) return;
+  if (action === "copy") {
+    await copyText(`${markdown}\n`);
+    state.notice = "交接包已复制";
+    renderAfterBackgroundRefresh();
+    return;
+  }
+  if (action === "new") {
+    await openNewSession();
+    const prompt = `请基于这个交接包继续当前工作：\n\n${markdown}\n`;
+    if (!setPromptDraft(prompt, { focus: true })) {
+      state.prompt = prompt;
+      render({ preserveComposer: false });
+      focusPromptEnd();
+    }
+    state.notice = "已创建新会话草稿";
+    return;
+  }
+  insertContextPackageMarkdown(markdown, activeInput);
+  state.notice = "交接包已插入输入框";
+}
+
+function insertContextPackageMarkdown(markdown, input = null) {
+  const existing = String(input?.value || state.prompt || "").trim();
+  const nextPrompt = existing ? `${existing}\n\n${markdown}\n` : `${markdown}\n`;
+  if (setPromptDraft(nextPrompt, { focus: true, input })) {
+    return;
+  }
+  state.prompt = nextPrompt;
+  render({ preserveComposer: false });
+  focusPromptEnd();
 }
 
 async function openWorkspaceFile(filePath) {
@@ -4554,6 +4628,11 @@ function skeletonCard() {
 
 function markFormControlInteraction() {
   lastFormControlInteractionAt = Date.now();
+}
+
+function isPromptInputFocused() {
+  const input = document.querySelector("#prompt-input");
+  return Boolean(input && document.activeElement === input);
 }
 
 function isFormControlInteractionActive() {
