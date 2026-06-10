@@ -2267,7 +2267,7 @@ test('enabling multi-user mode migrates the legacy password into an admin accoun
     const legacyLogin = await fetch(`${server.baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: 'single-password' }),
+      body: JSON.stringify({ username: 'admin', password: 'single-password' }),
     });
     assert.equal(legacyLogin.status, 200);
     const { token } = await legacyLogin.json();
@@ -2311,7 +2311,7 @@ test('legacy admin tokens continue writing admin-owned sessions after multi-user
   const auth = new HybridAuthStore({ legacyAuth, identityStore });
   const runtime = runtimeStub();
 
-  const legacyLogin = await auth.login({ password: 'single-password', deviceName: 'phone' });
+  const legacyLogin = await auth.login({ username: 'admin', password: 'single-password', deviceName: 'phone' });
   await auth.setMultiUserEnabled(true);
   await identityStore.upsertProject({
     id: 'project_admin',

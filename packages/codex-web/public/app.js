@@ -390,7 +390,7 @@ function renderLogin() {
         <p class="muted">登录后操作 Codex 远程会话</p>
         <label>
           <span>账号</span>
-          <input name="username" autocomplete="username" placeholder="账号" value="">
+          <input name="username" autocomplete="username" placeholder="admin" value="admin" required>
         </label>
         <label>
           <span>密码</span>

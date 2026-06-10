@@ -260,13 +260,14 @@ test('repeat opens with a stored token render the app shell before auth verifica
   assert.doesNotMatch(app, /form\.get\('deviceName'\)/u);
 });
 
-test('login form supports optional username for multi-user mode', async () => {
+test('login form uses the default single-user admin account', async () => {
   const app = await readFile(appUrl, 'utf8');
 
   assert.match(app, /name="username"/u);
   assert.match(app, /autocomplete="username"/u);
-  assert.match(app, /const username = String\(form\.get\('username'\) \|\| ''\);/u);
-  assert.match(app, /body: \{ username, password \}/u);
+  assert.match(app, /placeholder="admin"/u);
+  assert.match(app, /value="admin"/u);
+  assert.match(app, /username: String\(data\.get\("username"\) \|\| ""\)/u);
 });
 
 test('login form keeps typed credentials across mobile keyboard resize renders', async () => {

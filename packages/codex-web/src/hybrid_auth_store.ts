@@ -4,6 +4,7 @@ import { localAdminPrincipal, type CodexWebPrincipal } from './access_control.js
 import type { CodexWebUserSession, FileIdentityStore } from './identity_store.js';
 
 const DIGEST = 'sha256';
+const SINGLE_USER_USERNAME = 'admin';
 
 interface LegacyAuthLike {
   isConfigured(): Promise<boolean>;
@@ -105,6 +106,10 @@ export class HybridAuthStore {
   }): Promise<{ token: string; session: PublicAuthSession; configuredNow: boolean }> {
     const state = await this.identityStore.readState();
     if (!state.settings.multiUserEnabled) {
+      const normalizedUsername = String(username ?? '').trim();
+      if (normalizedUsername !== SINGLE_USER_USERNAME) {
+        throw new Error('Invalid username or password');
+      }
       const login = await this.legacyAuth.login({ password, deviceName });
       return {
         ...login,

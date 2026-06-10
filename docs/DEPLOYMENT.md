@@ -19,10 +19,11 @@ UI; code execution, file access, and provider credentials stay on the host.
 npm install
 ```
 
-## Configure login password
+## Configure login account
 
-Set the web login password on the host. Do not commit the password or generated
-state files.
+Set the web login password on the host. In the default single-user deployment,
+the web login account is `admin`; the password is stored only as a salted hash.
+Do not commit the password or generated state files.
 
 ```bash
 npm run codex-web -- auth set-password

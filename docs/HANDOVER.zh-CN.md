@@ -161,6 +161,8 @@ npm run codex-web -- auth set-password
 systemctl restart codex-web.service
 ```
 
+默认单用户网页登录账号是 `admin`。密码只保存 salted hash，不能从服务器反查明文；忘记后需要重新执行上面的命令重置。
+
 不要通过命令历史保存明文密码。若必须非交互设置，使用临时环境变量后立即清理 shell history 或在受控自动化环境中执行：
 
 ```bash

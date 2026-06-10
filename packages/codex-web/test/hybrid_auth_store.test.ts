@@ -24,12 +24,34 @@ test('hybrid auth keeps legacy single-user password login as local admin', async
     identityStore: new FileIdentityStore({ identityPath }),
   });
 
-  const login = await auth.login({ password: 'single-password', deviceName: 'phone' });
+  const login = await auth.login({ username: 'admin', password: 'single-password', deviceName: 'phone' });
   const verified = await auth.verifyToken(login.token);
 
   assert.equal(verified?.principal?.userId, 'local-admin');
   assert.equal(verified?.principal?.isAdmin, true);
   assert.equal(verified?.principal?.mode, 'single');
+});
+
+test('hybrid auth requires the admin username in single-user mode', async () => {
+  const { authPath, identityPath } = await tempPaths();
+  const legacyAuth = new AuthStore({ authPath });
+  await legacyAuth.setPassword('single-password');
+  const auth = new HybridAuthStore({
+    legacyAuth,
+    identityStore: new FileIdentityStore({ identityPath }),
+  });
+
+  await assert.rejects(
+    auth.login({ username: '', password: 'single-password', deviceName: 'phone' }),
+    /Invalid username or password/u,
+  );
+  await assert.rejects(
+    auth.login({ username: 'root', password: 'single-password', deviceName: 'phone' }),
+    /Invalid username or password/u,
+  );
+
+  const login = await auth.login({ username: 'admin', password: 'single-password', deviceName: 'phone' });
+  assert.match(login.token, /^cw_/u);
 });
 
 test('hybrid auth verifies multi-user username password and returns user principal', async () => {
